@@ -25,10 +25,21 @@ class JotFormHelper:
             forms = self.client.get_forms()
             print(f"[DEBUG] JotFormHelper.get_all_forms - Retrieved {len(forms)} forms from API")
             for form in forms:
+                # Get latest submission date for each form
+                latest_submission = None
+                try:
+                    submissions = self.client.get_form_submissions(form['id'], limit=1, orderby='created_at')
+                    if submissions and len(submissions) > 0:
+                        latest_submission = submissions[0].get('created_at', '')
+                        print(f"[DEBUG] JotFormHelper.get_all_forms - Form {form['id']} latest submission: {latest_submission}")
+                except Exception as e:
+                    print(f"[DEBUG] JotFormHelper.get_all_forms - Could not fetch submissions for {form['id']}: {e}")
+
                 self.forms_cache[form['id']] = {
                     'id': form['id'],
                     'title': form['title'],
-                    'created': form.get('created_at','')
+                    'created': form.get('created_at',''),
+                    'latest_submission': latest_submission or form.get('created_at','')
                 }
                 print(f"[DEBUG] JotFormHelper.get_all_forms - Added form: {form['id']} - {form['title']}")
         else:
@@ -400,31 +411,33 @@ def find_form_by_product_names(message_text, available_forms):
 def analyze_message_for_gb(message_text, available_forms):
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-    # Sort forms by creation date to identify the most recent
+    # Sort forms by latest submission date to identify the most recent/current GB
     sorted_forms = sorted(
         available_forms.items(),
-        key=lambda x: x[1].get('created', ''),
+        key=lambda x: x[1].get('latest_submission', x[1].get('created', '')),
         reverse=True
     )
 
     forms_list = "\n".join([
-        f"- {form_data['title']} (ID: {form_id}, Created: {form_data.get('created', 'Unknown')})"
+        f"- {form_data['title']} (ID: {form_id}, Latest Activity: {form_data.get('latest_submission', 'Unknown')})"
         for form_id, form_data in sorted_forms
     ])
 
     prompt = f"""You are helping identify which Group Buy (GB) form a user is asking about.
 
-Available forms (sorted by most recent first):
+Available forms (sorted by most recent submission activity - FIRST = most active/current):
 {forms_list}
 
 User message: "{message_text}"
 
 Analyze the user's message and determine which form they're asking about:
 1. If they mention a specific month name (January, February, November, December, etc.), look for that month in the form title
-2. If they ask about "current", "latest", or "newest" GB, choose the FIRST form in the list (most recent)
-3. If they mention a date, match it to the closest form by creation date
+2. CRITICAL: If they ask about "current", "latest", "newest", or "most recent" GB, choose the FIRST form in the list (it has the most recent submission activity)
+3. If they mention a date, match it to the closest form by Latest Activity timestamp
 4. If they mention a vendor name, try to match it to a form title
 5. If the message is completely unclear or ambiguous, respond with "UNCLEAR"
+
+NOTE: Forms are sorted by latest submission date, NOT creation date. The first form is the most currently active GB.
 
 IMPORTANT: Respond with ONLY the form ID number (e.g., "253411113426040") or the word "UNCLEAR".
 Do not include any other text, explanation, or formatting."""
