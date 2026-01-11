@@ -145,6 +145,30 @@ async def get_current_gb_info():
 
 
 # =============================================================================
+# DEADLINE HELPER FUNCTIONS
+# =============================================================================
+
+async def get_deadline():
+    """Get the manually set deadline for the current GB."""
+    return await get_setting('current_gb_deadline')
+
+
+async def set_deadline(deadline: str, user_id: int = None, username: str = None):
+    """Set the deadline for the current GB."""
+    await set_setting('current_gb_deadline', deadline, user_id, username)
+
+
+async def clear_deadline():
+    """Clear the manually set deadline."""
+    await delete_setting('current_gb_deadline')
+
+
+async def get_deadline_info():
+    """Get full info about who set the deadline and when."""
+    return await get_setting_info('current_gb_deadline')
+
+
+# =============================================================================
 # ADMIN MANAGEMENT FUNCTIONS
 # =============================================================================
 

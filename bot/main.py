@@ -13,7 +13,8 @@ import re
 from database import (
     init_db, get_current_gb, set_current_gb, clear_current_gb,
     get_current_gb_info, is_admin, add_admin, remove_admin,
-    get_all_admins, get_admin_count
+    get_all_admins, get_admin_count, get_deadline, set_deadline,
+    clear_deadline, get_deadline_info
 )
 
 load_dotenv()
@@ -696,6 +697,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Admin Commands:\n"
         "/setcurrentgb <id or name> - Set current GB\n"
         "/clearcurrentgb - Clear manual GB setting\n"
+        "/setdeadline <date> - Set deadline for current GB\n"
+        "/cleardeadline - Clear manual deadline setting\n"
         "/refresh - Refresh cached data\n"
         "/addadmin - Add a bot admin\n"
         "/removeadmin <id> - Remove an admin\n"
@@ -998,26 +1001,72 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         forms = jotform_helper.get_all_forms()
         form_title = forms.get(form_id, {}).get('title', 'Current GB')
 
-        # Get metadata
-        metadata = jotform_helper.get_form_metadata(form_id)
-        deadline = metadata.get('deadline') or metadata.get('closing_date')
+        # Check database first for manually set deadline
+        db_deadline = await get_deadline()
+        deadline_info = await get_deadline_info() if db_deadline else None
 
-        if deadline:
-            await update.message.reply_text(
-                f"Deadline for {form_title}:\n\n"
-                f"{deadline}\n\n"
-                "Submit your order before this date!"
-            )
+        if db_deadline:
+            response = f"Deadline for {form_title}:\n\n{db_deadline}\n\nSubmit your order before this date!"
+            if deadline_info and deadline_info.get('updated_by'):
+                response += f"\n\n(Set by @{deadline_info['updated_by']})"
+            await update.message.reply_text(response)
         else:
-            await update.message.reply_text(
-                f"No deadline found for {form_title}.\n\n"
-                "The deadline may not be set in the form, or it might be in the form title. "
-                "Check with an admin for the exact closing date."
-            )
+            # Fall back to JotForm metadata
+            metadata = jotform_helper.get_form_metadata(form_id)
+            deadline = metadata.get('deadline') or metadata.get('closing_date')
+
+            if deadline:
+                await update.message.reply_text(
+                    f"Deadline for {form_title}:\n\n"
+                    f"{deadline}\n\n"
+                    "Submit your order before this date!"
+                )
+            else:
+                await update.message.reply_text(
+                    f"No deadline set for {form_title}.\n\n"
+                    "An admin can set it with /setdeadline <date>"
+                )
 
     except Exception as e:
         print(f"[ERROR] deadline_command: {e}")
         await update.message.reply_text("Error retrieving deadline. Please try again.")
+
+
+async def setdeadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to set the deadline for the current GB."""
+    user = update.effective_user
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /setdeadline <deadline text>\n\n"
+            "Examples:\n"
+            "/setdeadline January 15, 2025\n"
+            "/setdeadline Friday at midnight EST\n"
+            "/setdeadline 01/15/25 11:59 PM"
+        )
+        return
+
+    deadline_text = " ".join(context.args)
+
+    await set_deadline(
+        deadline_text,
+        user_id=user.id,
+        username=user.username or user.first_name
+    )
+
+    await update.message.reply_text(
+        f"Deadline set to:\n{deadline_text}\n\n"
+        "Users can now see this with /deadline"
+    )
+
+
+async def cleardeadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to clear the manually set deadline."""
+    await clear_deadline()
+    await update.message.reply_text(
+        "Deadline cleared.\n"
+        "The bot will now try to detect it from the JotForm (if available)."
+    )
 
 
 # =============================================================================
@@ -1213,6 +1262,8 @@ async def post_init(application):
         BotCommand("listforms", "List all available forms"),
         BotCommand("setcurrentgb", "Set current GB (admin)"),
         BotCommand("clearcurrentgb", "Clear GB setting (admin)"),
+        BotCommand("setdeadline", "Set deadline (admin)"),
+        BotCommand("cleardeadline", "Clear deadline (admin)"),
         BotCommand("refresh", "Refresh cached data (admin)"),
         BotCommand("addadmin", "Add a bot admin"),
         BotCommand("listadmins", "List all admins"),
@@ -1239,6 +1290,8 @@ def main():
     # Register command handlers - Admin
     app.add_handler(CommandHandler("setcurrentgb", setcurrentgb_command))
     app.add_handler(CommandHandler("clearcurrentgb", clearcurrentgb_command))
+    app.add_handler(CommandHandler("setdeadline", setdeadline_command))
+    app.add_handler(CommandHandler("cleardeadline", cleardeadline_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(CommandHandler("addadmin", addadmin_command))
     app.add_handler(CommandHandler("removeadmin", removeadmin_command))
