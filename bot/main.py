@@ -100,17 +100,75 @@ Respond with ONLY the form ID (the number) or "UNCLEAR". Nothing else."""
     result = response.choices[0].message.content.strip()
     return result if result != "UNCLEAR" else None
 
+# Initialize global JotFormHelper instance
+jotform_helper = JotFormHelper()
+
 # Start/Welcome Message
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Hello there! I'm Bohemia's Steward. I'm alive!")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Available commands:\n/start - Say hello\n/help - Show this message")
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower()
-    if 'how long' in text or 'timeline' in text or 'timeframe' in text:
+    text = update.message.text
+    text_lower = text.lower()
+
+    # Handle timeline questions
+    if 'how long' in text_lower or 'timeline' in text_lower or 'timeframe' in text_lower:
         await update.message.reply_text(
             "On average, GBs take around 4-8 weeks to be completed. This timeframe does not include vendor production on custom-made batches, custom delays, or seizures. International shipping from the GBO to members can take longer.\n"
             "Use /help for more commands!"
+        )
+        return
+
+    # Try to identify which form the user is asking about using ChatGPT
+    try:
+        await update.message.reply_text("🤔 Let me check that for you...")
+
+        # Get all available forms
+        available_forms = jotform_helper.get_all_forms()
+
+        # Use ChatGPT to analyze the message and identify the form
+        form_id = analyze_message_for_gb(text, available_forms)
+
+        if form_id:
+            # Get products for the identified form
+            products = jotform_helper.get_products(form_id)
+
+            if products:
+                # Get form title
+                form_title = available_forms.get(form_id, {}).get('title', 'Group Buy')
+
+                # Format the response
+                response = f"📋 *{form_title}*\n\n"
+                response += f"Found {len(products)} product(s):\n\n"
+
+                for idx, product in enumerate(products, 1):
+                    name = product.get('name', 'N/A')
+                    price = product.get('price', 'N/A')
+                    description = product.get('description', 'N/A')
+
+                    response += f"{idx}. *{name}*\n"
+                    response += f"   💰 Price: ${price}\n"
+
+                    # Truncate long descriptions
+                    if len(description) > 100:
+                        description = description[:100] + "..."
+                    response += f"   📝 {description}\n\n"
+
+                await update.message.reply_text(response, parse_mode='Markdown')
+            else:
+                await update.message.reply_text(
+                    "I found the form, but couldn't retrieve any products. Please try again later."
+                )
+        else:
+            await update.message.reply_text(
+                "I'm not sure which Group Buy you're asking about. Could you please be more specific? "
+                "Try mentioning a month (e.g., 'January GB') or ask about the 'current' or 'latest' GB."
+            )
+    except Exception as e:
+        print(f"Error in handle_message: {e}")
+        await update.message.reply_text(
+            "Sorry, I encountered an error processing your request. Please try again later."
         )
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -121,8 +179,4 @@ def main():
     app.run_polling()
 
 if __name__ == '__main__':
-    form_id = '253411113426040'
-    jotform_helper = JotFormHelper()
-    jotform_helper.get_products(form_id)
-    print(jotform_helper.products_cache[form_id])
     main()
