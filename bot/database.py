@@ -169,6 +169,54 @@ async def get_deadline_info():
 
 
 # =============================================================================
+# VENDORS HELPER FUNCTIONS
+# =============================================================================
+
+async def get_vendors():
+    """Get the manually set vendors for the current GB."""
+    return await get_setting('current_gb_vendors')
+
+
+async def set_vendors(vendors: str, user_id: int = None, username: str = None):
+    """Set the vendors for the current GB."""
+    await set_setting('current_gb_vendors', vendors, user_id, username)
+
+
+async def clear_vendors():
+    """Clear the manually set vendors."""
+    await delete_setting('current_gb_vendors')
+
+
+async def get_vendors_info():
+    """Get full info about who set the vendors and when."""
+    return await get_setting_info('current_gb_vendors')
+
+
+# =============================================================================
+# STATUS HELPER FUNCTIONS
+# =============================================================================
+
+async def get_status():
+    """Get the current GB status."""
+    return await get_setting('current_gb_status')
+
+
+async def set_status(status: str, user_id: int = None, username: str = None):
+    """Set the status for the current GB."""
+    await set_setting('current_gb_status', status, user_id, username)
+
+
+async def clear_status():
+    """Clear the manually set status."""
+    await delete_setting('current_gb_status')
+
+
+async def get_status_info():
+    """Get full info about who set the status and when."""
+    return await get_setting_info('current_gb_status')
+
+
+# =============================================================================
 # ADMIN MANAGEMENT FUNCTIONS
 # =============================================================================
 

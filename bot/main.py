@@ -14,7 +14,9 @@ from database import (
     init_db, get_current_gb, set_current_gb, clear_current_gb,
     get_current_gb_info, is_admin, add_admin, remove_admin,
     get_all_admins, get_admin_count, get_deadline, set_deadline,
-    clear_deadline, get_deadline_info
+    clear_deadline, get_deadline_info, get_vendors, set_vendors,
+    clear_vendors, get_vendors_info, get_status, set_status,
+    clear_status, get_status_info
 )
 
 load_dotenv()
@@ -691,14 +693,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Group Buy Info:\n"
         "/currentgb - Show current GB details\n"
         "/products - List products in current GB\n"
-        "/products <search> - Search products (e.g., /products reta)\n"
+        "/products <search> - Search products\n"
         "/deadline - Show current GB deadline\n"
+        "/vendors - Show current GB vendors\n"
+        "/status - Show current GB status\n"
+        "/jotform - Get link to order form\n"
         "/listforms - List all available forms\n\n"
         "Admin Commands:\n"
         "/setcurrentgb <id or name> - Set current GB\n"
-        "/clearcurrentgb - Clear manual GB setting\n"
-        "/setdeadline <date> - Set deadline for current GB\n"
-        "/cleardeadline - Clear manual deadline setting\n"
+        "/clearcurrentgb - Clear GB setting\n"
+        "/setdeadline <date> - Set deadline\n"
+        "/cleardeadline - Clear deadline\n"
+        "/setvendors <names> - Set vendors\n"
+        "/clearvendors - Clear vendors\n"
+        "/setstatus <text> - Set status\n"
+        "/clearstatus - Clear status\n"
         "/refresh - Refresh cached data\n"
         "/addadmin - Add a bot admin\n"
         "/removeadmin <id> - Remove an admin\n"
@@ -1070,6 +1079,200 @@ async def cleardeadline_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # =============================================================================
+# VENDORS COMMANDS
+# =============================================================================
+
+async def vendors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the vendors for the current Group Buy."""
+    try:
+        form_id, is_manual = await get_current_gb_form_id()
+
+        if not form_id:
+            await update.message.reply_text(
+                "No current GB found. Use /setcurrentgb to set one."
+            )
+            return
+
+        # Get form info
+        forms = jotform_helper.get_all_forms()
+        form_title = forms.get(form_id, {}).get('title', 'Current GB')
+
+        # Check database for manually set vendors
+        db_vendors = await get_vendors()
+        vendors_info = await get_vendors_info() if db_vendors else None
+
+        if db_vendors:
+            response = f"Vendors for {form_title}:\n\n{db_vendors}"
+            if vendors_info and vendors_info.get('updated_by'):
+                response += f"\n\n(Set by @{vendors_info['updated_by']})"
+            await update.message.reply_text(response)
+        else:
+            # Try to get from JotForm metadata
+            metadata = jotform_helper.get_form_metadata(form_id)
+            vendor = metadata.get('vendor')
+            suppliers = metadata.get('suppliers', [])
+
+            if vendor:
+                await update.message.reply_text(f"Vendor for {form_title}:\n\n{vendor}")
+            elif suppliers:
+                suppliers_text = ", ".join(suppliers)
+                await update.message.reply_text(f"Vendors for {form_title}:\n\n{suppliers_text}")
+            else:
+                await update.message.reply_text(
+                    f"No vendors set for {form_title}.\n\n"
+                    "An admin can set them with /setvendors <vendor names>"
+                )
+
+    except Exception as e:
+        print(f"[ERROR] vendors_command: {e}")
+        await update.message.reply_text("Error retrieving vendors. Please try again.")
+
+
+async def setvendors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to set the vendors for the current GB."""
+    user = update.effective_user
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /setvendors <vendor names>\n\n"
+            "Examples:\n"
+            "/setvendors QSC\n"
+            "/setvendors QSC, Amo, Tracy\n"
+            "/setvendors Multiple vendors - see product list"
+        )
+        return
+
+    vendors_text = " ".join(context.args)
+
+    await set_vendors(
+        vendors_text,
+        user_id=user.id,
+        username=user.username or user.first_name
+    )
+
+    await update.message.reply_text(
+        f"Vendors set to:\n{vendors_text}\n\n"
+        "Users can now see this with /vendors"
+    )
+
+
+async def clearvendors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to clear the manually set vendors."""
+    await clear_vendors()
+    await update.message.reply_text(
+        "Vendors cleared.\n"
+        "The bot will now try to detect them from the JotForm (if available)."
+    )
+
+
+# =============================================================================
+# STATUS COMMANDS
+# =============================================================================
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the current status of the Group Buy."""
+    try:
+        form_id, is_manual = await get_current_gb_form_id()
+
+        if not form_id:
+            await update.message.reply_text(
+                "No current GB found. Use /setcurrentgb to set one."
+            )
+            return
+
+        # Get form info
+        forms = jotform_helper.get_all_forms()
+        form_title = forms.get(form_id, {}).get('title', 'Current GB')
+
+        # Check database for status
+        db_status = await get_status()
+        status_info = await get_status_info() if db_status else None
+
+        if db_status:
+            response = f"Status for {form_title}:\n\n{db_status}"
+            if status_info and status_info.get('updated_by'):
+                response += f"\n\n(Updated by @{status_info['updated_by']})"
+            await update.message.reply_text(response)
+        else:
+            await update.message.reply_text(
+                f"No status set for {form_title}.\n\n"
+                "An admin can set it with /setstatus <status update>"
+            )
+
+    except Exception as e:
+        print(f"[ERROR] status_command: {e}")
+        await update.message.reply_text("Error retrieving status. Please try again.")
+
+
+async def setstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to set the status for the current GB."""
+    user = update.effective_user
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /setstatus <status text>\n\n"
+            "Examples:\n"
+            "/setstatus Orders open - deadline Jan 15\n"
+            "/setstatus Waiting on shipment from vendor\n"
+            "/setstatus Packages shipped - tracking sent via DM\n"
+            "/setstatus GB closed - processing orders"
+        )
+        return
+
+    status_text = " ".join(context.args)
+
+    await set_status(
+        status_text,
+        user_id=user.id,
+        username=user.username or user.first_name
+    )
+
+    await update.message.reply_text(
+        f"Status set to:\n{status_text}\n\n"
+        "Users can now see this with /status"
+    )
+
+
+async def clearstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to clear the status."""
+    await clear_status()
+    await update.message.reply_text("Status cleared.")
+
+
+# =============================================================================
+# JOTFORM LINK COMMAND
+# =============================================================================
+
+async def jotform_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the JotForm link for the current Group Buy."""
+    try:
+        form_id, is_manual = await get_current_gb_form_id()
+
+        if not form_id:
+            await update.message.reply_text(
+                "No current GB found. Use /setcurrentgb to set one."
+            )
+            return
+
+        # Get form info
+        forms = jotform_helper.get_all_forms()
+        form_title = forms.get(form_id, {}).get('title', 'Current GB')
+
+        # JotForm URLs follow this pattern
+        jotform_url = f"https://form.jotform.com/{form_id}"
+
+        await update.message.reply_text(
+            f"Order Form for {form_title}:\n\n"
+            f"{jotform_url}\n\n"
+            "Click the link above to place your order!"
+        )
+
+    except Exception as e:
+        print(f"[ERROR] jotform_command: {e}")
+        await update.message.reply_text("Error retrieving form link. Please try again.")
+
+
+# =============================================================================
 # ADMIN MANAGEMENT COMMANDS
 # =============================================================================
 
@@ -1259,11 +1462,18 @@ async def post_init(application):
         BotCommand("currentgb", "Show current GB details"),
         BotCommand("products", "List products in current GB"),
         BotCommand("deadline", "Show current GB deadline"),
+        BotCommand("vendors", "Show current GB vendors"),
+        BotCommand("status", "Show current GB status"),
+        BotCommand("jotform", "Get link to order form"),
         BotCommand("listforms", "List all available forms"),
         BotCommand("setcurrentgb", "Set current GB (admin)"),
         BotCommand("clearcurrentgb", "Clear GB setting (admin)"),
         BotCommand("setdeadline", "Set deadline (admin)"),
         BotCommand("cleardeadline", "Clear deadline (admin)"),
+        BotCommand("setvendors", "Set vendors (admin)"),
+        BotCommand("clearvendors", "Clear vendors (admin)"),
+        BotCommand("setstatus", "Set status (admin)"),
+        BotCommand("clearstatus", "Clear status (admin)"),
         BotCommand("refresh", "Refresh cached data (admin)"),
         BotCommand("addadmin", "Add a bot admin"),
         BotCommand("listadmins", "List all admins"),
@@ -1285,6 +1495,9 @@ def main():
     app.add_handler(CommandHandler("currentgb", currentgb_command))
     app.add_handler(CommandHandler("products", products_command))
     app.add_handler(CommandHandler("deadline", deadline_command))
+    app.add_handler(CommandHandler("vendors", vendors_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("jotform", jotform_command))
     app.add_handler(CommandHandler("listforms", listforms_command))
 
     # Register command handlers - Admin
@@ -1292,6 +1505,10 @@ def main():
     app.add_handler(CommandHandler("clearcurrentgb", clearcurrentgb_command))
     app.add_handler(CommandHandler("setdeadline", setdeadline_command))
     app.add_handler(CommandHandler("cleardeadline", cleardeadline_command))
+    app.add_handler(CommandHandler("setvendors", setvendors_command))
+    app.add_handler(CommandHandler("clearvendors", clearvendors_command))
+    app.add_handler(CommandHandler("setstatus", setstatus_command))
+    app.add_handler(CommandHandler("clearstatus", clearstatus_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(CommandHandler("addadmin", addadmin_command))
     app.add_handler(CommandHandler("removeadmin", removeadmin_command))
