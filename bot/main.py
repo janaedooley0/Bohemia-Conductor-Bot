@@ -4,7 +4,7 @@ import asyncio
 from dotenv import load_dotenv
 from openai import OpenAI
 from jotform import JotformAPIClient
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import json
 import re
@@ -1201,6 +1201,24 @@ async def post_init(application):
     print("[STARTUP] Initializing database...")
     await init_db()
     print("[STARTUP] Database initialized.")
+
+    # Register bot commands with Telegram (shows in command menu when user types '/')
+    commands = [
+        BotCommand("start", "Welcome message"),
+        BotCommand("help", "Show all commands"),
+        BotCommand("faq", "Frequently asked questions"),
+        BotCommand("currentgb", "Show current GB details"),
+        BotCommand("products", "List products in current GB"),
+        BotCommand("deadline", "Show current GB deadline"),
+        BotCommand("listforms", "List all available forms"),
+        BotCommand("setcurrentgb", "Set current GB (admin)"),
+        BotCommand("clearcurrentgb", "Clear GB setting (admin)"),
+        BotCommand("refresh", "Refresh cached data (admin)"),
+        BotCommand("addadmin", "Add a bot admin"),
+        BotCommand("listadmins", "List all admins"),
+    ]
+    await application.bot.set_my_commands(commands)
+    print("[STARTUP] Bot commands registered with Telegram.")
 
 
 def main():
