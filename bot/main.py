@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 from dotenv import load_dotenv
 from openai import OpenAI
 from jotform import JotformAPIClient
@@ -7,6 +8,13 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import json
 import re
+
+# Import database module
+from database import (
+    init_db, get_current_gb, set_current_gb, clear_current_gb,
+    get_current_gb_info, is_admin, add_admin, remove_admin,
+    get_all_admins, get_admin_count
+)
 
 load_dotenv()
 
@@ -674,16 +682,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show available commands and how to use the bot."""
     await update.message.reply_text(
-        "Available commands:\n"
+        "Available Commands:\n\n"
+        "General:\n"
         "/start - Welcome message\n"
         "/help - Show this message\n"
-        "/faq - Show frequently asked questions\n"
-        "/refresh - Refresh cached data (admin)\n\n"
-        "You can also just ask me questions like:\n"
-        "- 'What products are in the current GB?'\n"
-        "- 'How do I place an order?'\n"
+        "/faq - Show frequently asked questions\n\n"
+        "Group Buy Info:\n"
+        "/currentgb - Show current GB details\n"
+        "/products - List products in current GB\n"
+        "/products <search> - Search products (e.g., /products reta)\n"
+        "/deadline - Show current GB deadline\n"
+        "/listforms - List all available forms\n\n"
+        "Admin Commands:\n"
+        "/setcurrentgb <id or name> - Set current GB\n"
+        "/clearcurrentgb - Clear manual GB setting\n"
+        "/refresh - Refresh cached data\n"
+        "/addadmin - Add a bot admin\n"
+        "/removeadmin <id> - Remove an admin\n"
+        "/listadmins - List all admins\n\n"
+        "Or just ask me questions like:\n"
         "- 'What's the price of Retatrutide?'\n"
-        "- 'How long does shipping take?'"
+        "- 'How do I place an order?'"
     )
 
 async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -713,6 +732,390 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Cache cleared! Fresh data will be fetched on the next request.\n"
         f"Cache TTL is set to {CACHE_TTL_SECONDS} seconds."
     )
+
+
+# =============================================================================
+# CURRENT GB HELPER FUNCTION
+# =============================================================================
+
+async def get_current_gb_form_id():
+    """
+    Get the current GB form ID.
+    First checks if admin has manually set one, otherwise falls back to auto-detection.
+    Returns tuple of (form_id, is_manual) where is_manual indicates if it was set by admin.
+    """
+    # Check if there's a manually set current GB
+    manual_gb = await get_current_gb()
+    if manual_gb:
+        print(f"[DEBUG] get_current_gb_form_id - Using manually set GB: {manual_gb}")
+        return manual_gb, True
+
+    # Fall back to auto-detection (most recent submission activity)
+    forms = jotform_helper.get_all_forms()
+    if not forms:
+        return None, False
+
+    # Sort by latest submission date
+    sorted_forms = sorted(
+        forms.items(),
+        key=lambda x: x[1].get('latest_submission', x[1].get('created', '')),
+        reverse=True
+    )
+
+    if sorted_forms:
+        form_id = sorted_forms[0][0]
+        print(f"[DEBUG] get_current_gb_form_id - Auto-detected current GB: {form_id}")
+        return form_id, False
+
+    return None, False
+
+
+# =============================================================================
+# PHASE 2 COMMANDS
+# =============================================================================
+
+async def listforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all available JotForm forms with their IDs."""
+    try:
+        forms = jotform_helper.get_all_forms()
+        if not forms:
+            await update.message.reply_text("No forms found.")
+            return
+
+        # Sort by latest submission date
+        sorted_forms = sorted(
+            forms.items(),
+            key=lambda x: x[1].get('latest_submission', x[1].get('created', '')),
+            reverse=True
+        )
+
+        # Get current GB to mark it
+        current_gb_id, is_manual = await get_current_gb_form_id()
+
+        lines = ["Available Forms:\n"]
+        for idx, (form_id, form_data) in enumerate(sorted_forms, 1):
+            title = form_data.get('title', 'Untitled')
+            marker = " [CURRENT]" if form_id == current_gb_id else ""
+            lines.append(f"{idx}. {title}{marker}\n   ID: {form_id}")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        print(f"[ERROR] listforms_command: {e}")
+        await update.message.reply_text("Error retrieving forms. Please try again.")
+
+
+async def setcurrentgb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to set the current Group Buy form."""
+    user = update.effective_user
+
+    # Check if user provided an argument
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /setcurrentgb <form_id or search term>\n\n"
+            "Examples:\n"
+            "/setcurrentgb 253411113426040\n"
+            "/setcurrentgb December\n"
+            "/setcurrentgb QSC\n\n"
+            "Use /listforms to see available forms and their IDs."
+        )
+        return
+
+    search_term = " ".join(context.args)
+    forms = jotform_helper.get_all_forms()
+
+    # Try to find the form
+    found_form_id = None
+    found_form_title = None
+
+    # First, check if it's an exact form ID
+    if search_term in forms:
+        found_form_id = search_term
+        found_form_title = forms[search_term].get('title', 'Unknown')
+    else:
+        # Search by title (case-insensitive)
+        search_lower = search_term.lower()
+        for form_id, form_data in forms.items():
+            title = form_data.get('title', '').lower()
+            if search_lower in title:
+                found_form_id = form_id
+                found_form_title = form_data.get('title', 'Unknown')
+                break
+
+    if found_form_id:
+        # Save to database
+        await set_current_gb(
+            found_form_id,
+            user_id=user.id,
+            username=user.username or user.first_name
+        )
+        await update.message.reply_text(
+            f"Current GB set to:\n"
+            f"{found_form_title}\n"
+            f"(ID: {found_form_id})\n\n"
+            f"All /products, /currentgb, and /deadline commands will now use this form."
+        )
+    else:
+        await update.message.reply_text(
+            f"Could not find a form matching '{search_term}'.\n\n"
+            "Use /listforms to see available forms."
+        )
+
+
+async def clearcurrentgb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to clear the manual current GB setting."""
+    await clear_current_gb()
+    await update.message.reply_text(
+        "Current GB setting cleared.\n"
+        "The bot will now auto-detect the current GB based on latest submission activity."
+    )
+
+
+async def currentgb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show information about the current Group Buy."""
+    try:
+        form_id, is_manual = await get_current_gb_form_id()
+
+        if not form_id:
+            await update.message.reply_text(
+                "No current GB found. Use /listforms to see available forms."
+            )
+            return
+
+        # Get form info
+        forms = jotform_helper.get_all_forms()
+        form_data = forms.get(form_id, {})
+        form_title = form_data.get('title', 'Unknown')
+
+        # Get metadata (vendor, deadline)
+        metadata = jotform_helper.get_form_metadata(form_id)
+        vendor = metadata.get('vendor', 'Not specified')
+        deadline = metadata.get('deadline', 'Not specified')
+
+        # Get product count
+        products = jotform_helper.get_products(form_id)
+        product_count = len(products) if products else 0
+
+        # Build response
+        source = "(manually set)" if is_manual else "(auto-detected)"
+        response = (
+            f"Current Group Buy {source}:\n\n"
+            f"Form: {form_title}\n"
+            f"Vendor: {vendor}\n"
+            f"Deadline: {deadline}\n"
+            f"Products: {product_count} items\n\n"
+            f"Use /products to see the product list."
+        )
+
+        # Add who set it if manual
+        if is_manual:
+            gb_info = await get_current_gb_info()
+            if gb_info and gb_info.get('updated_by'):
+                response += f"\nSet by: @{gb_info['updated_by']}"
+
+        await update.message.reply_text(response)
+
+    except Exception as e:
+        print(f"[ERROR] currentgb_command: {e}")
+        await update.message.reply_text("Error retrieving current GB info. Please try again.")
+
+
+async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all products in the current Group Buy."""
+    try:
+        # Check if user provided a search filter
+        search_filter = " ".join(context.args).lower() if context.args else None
+
+        form_id, is_manual = await get_current_gb_form_id()
+
+        if not form_id:
+            await update.message.reply_text(
+                "No current GB set. Use /setcurrentgb to set one, or /listforms to see available forms."
+            )
+            return
+
+        # Get form title
+        forms = jotform_helper.get_all_forms()
+        form_title = forms.get(form_id, {}).get('title', 'Current GB')
+
+        # Get products
+        products = jotform_helper.get_products(form_id)
+
+        if not products:
+            await update.message.reply_text(f"No products found in {form_title}.")
+            return
+
+        # Filter products if search term provided
+        if search_filter:
+            filtered_products = [
+                p for p in products
+                if search_filter in p.get('name', '').lower()
+            ]
+            if not filtered_products:
+                await update.message.reply_text(
+                    f"No products matching '{search_filter}' found in {form_title}.\n"
+                    f"Use /products without arguments to see all {len(products)} products."
+                )
+                return
+            products = filtered_products
+
+        # Format product list
+        lines = [f"Products in {form_title}:\n"]
+
+        for idx, product in enumerate(products, 1):
+            name = product.get('name', 'N/A')
+            price = product.get('price', 'N/A')
+            lines.append(f"{idx}. {name} - ${price}")
+
+            # Stop if message gets too long (Telegram limit ~4096 chars)
+            if len("\n".join(lines)) > 3500:
+                lines.append(f"\n... and {len(products) - idx} more products.")
+                lines.append("Use /products <search> to filter (e.g., /products reta)")
+                break
+
+        if search_filter:
+            lines.append(f"\nShowing {len(products)} products matching '{search_filter}'")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        print(f"[ERROR] products_command: {e}")
+        await update.message.reply_text("Error retrieving products. Please try again.")
+
+
+async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the deadline for the current Group Buy."""
+    try:
+        form_id, is_manual = await get_current_gb_form_id()
+
+        if not form_id:
+            await update.message.reply_text(
+                "No current GB found. Use /setcurrentgb to set one."
+            )
+            return
+
+        # Get form info
+        forms = jotform_helper.get_all_forms()
+        form_title = forms.get(form_id, {}).get('title', 'Current GB')
+
+        # Get metadata
+        metadata = jotform_helper.get_form_metadata(form_id)
+        deadline = metadata.get('deadline') or metadata.get('closing_date')
+
+        if deadline:
+            await update.message.reply_text(
+                f"Deadline for {form_title}:\n\n"
+                f"{deadline}\n\n"
+                "Submit your order before this date!"
+            )
+        else:
+            await update.message.reply_text(
+                f"No deadline found for {form_title}.\n\n"
+                "The deadline may not be set in the form, or it might be in the form title. "
+                "Check with an admin for the exact closing date."
+            )
+
+    except Exception as e:
+        print(f"[ERROR] deadline_command: {e}")
+        await update.message.reply_text("Error retrieving deadline. Please try again.")
+
+
+# =============================================================================
+# ADMIN MANAGEMENT COMMANDS
+# =============================================================================
+
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a user as a bot admin. First admin can be added by anyone, subsequent admins require existing admin."""
+    user = update.effective_user
+    admin_count = await get_admin_count()
+
+    # If there are already admins, check if current user is admin
+    if admin_count > 0:
+        if not await is_admin(user.id):
+            await update.message.reply_text("Only existing admins can add new admins.")
+            return
+
+    # Check if replying to a message or provided user ID
+    target_user = None
+    target_username = None
+
+    if update.message.reply_to_message:
+        # Adding the user being replied to
+        target_user = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username or \
+                         update.message.reply_to_message.from_user.first_name
+    elif context.args:
+        # Try to parse user ID from args
+        try:
+            target_user = int(context.args[0])
+            target_username = context.args[1] if len(context.args) > 1 else f"User {target_user}"
+        except ValueError:
+            await update.message.reply_text(
+                "Usage: /addadmin <user_id> [username]\n"
+                "Or reply to a user's message with /addadmin"
+            )
+            return
+    else:
+        # Add self as admin (useful for first admin setup)
+        target_user = user.id
+        target_username = user.username or user.first_name
+
+    await add_admin(
+        target_user,
+        target_username,
+        added_by_user_id=user.id,
+        added_by_username=user.username or user.first_name
+    )
+
+    if admin_count == 0:
+        await update.message.reply_text(
+            f"@{target_username} added as the first admin!\n"
+            "You can now use admin commands like /setcurrentgb, /refresh, etc."
+        )
+    else:
+        await update.message.reply_text(f"@{target_username} added as admin.")
+
+
+async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a user from bot admins."""
+    user = update.effective_user
+
+    if not await is_admin(user.id):
+        await update.message.reply_text("Only admins can remove other admins.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /removeadmin <user_id>")
+        return
+
+    try:
+        target_user = int(context.args[0])
+        await remove_admin(target_user)
+        await update.message.reply_text(f"User {target_user} removed from admins.")
+    except ValueError:
+        await update.message.reply_text("Please provide a valid user ID.")
+
+
+async def listadmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all bot admins."""
+    admins = await get_all_admins()
+
+    if not admins:
+        await update.message.reply_text(
+            "No admins configured yet.\n"
+            "Use /addadmin to add yourself as the first admin."
+        )
+        return
+
+    lines = ["Bot Admins:\n"]
+    for admin in admins:
+        username = admin.get('username', 'Unknown')
+        user_id = admin.get('user_id')
+        lines.append(f"- @{username} ({user_id})")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     text_lower = text.lower()
@@ -793,20 +1196,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Sorry, I encountered an error processing your request. Please try again later."
         )
-def main():
-    app = Application.builder().token(TOKEN).build()
+async def post_init(application):
+    """Initialize database and other startup tasks."""
+    print("[STARTUP] Initializing database...")
+    await init_db()
+    print("[STARTUP] Database initialized.")
 
-    # Register command handlers
+
+def main():
+    # Build application with post_init callback
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+
+    # Register command handlers - General
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("faq", faq_command))
+
+    # Register command handlers - Group Buy Info
+    app.add_handler(CommandHandler("currentgb", currentgb_command))
+    app.add_handler(CommandHandler("products", products_command))
+    app.add_handler(CommandHandler("deadline", deadline_command))
+    app.add_handler(CommandHandler("listforms", listforms_command))
+
+    # Register command handlers - Admin
+    app.add_handler(CommandHandler("setcurrentgb", setcurrentgb_command))
+    app.add_handler(CommandHandler("clearcurrentgb", clearcurrentgb_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
+    app.add_handler(CommandHandler("addadmin", addadmin_command))
+    app.add_handler(CommandHandler("removeadmin", removeadmin_command))
+    app.add_handler(CommandHandler("listadmins", listadmins_command))
 
     # Register message handler for non-command messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print(f"Bot is running... (Cache TTL: {CACHE_TTL_SECONDS}s)")
     app.run_polling()
+
 
 if __name__ == '__main__':
     main()
