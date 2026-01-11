@@ -16,6 +16,7 @@ class JotFormHelper:
         self.client = JotformAPIClient(os.getenv('JOTFORM_API_KEY'))
         self.forms_cache = {}
         self.products_cache = {} #products are stored here
+        self.form_metadata_cache = {} # Store full form metadata including vendor info
 
     def get_all_forms(self):
         # Get list of all forms
@@ -33,6 +34,81 @@ class JotFormHelper:
         else:
             print(f"[DEBUG] JotFormHelper.get_all_forms - Using cached forms ({len(self.forms_cache)} forms)")
         return self.forms_cache
+
+    def get_form_metadata(self, form_id):
+        """Get full form metadata including vendor, questions, and other properties"""
+        if form_id in self.form_metadata_cache:
+            print(f"[DEBUG] JotFormHelper.get_form_metadata - Using cached metadata for form {form_id}")
+            return self.form_metadata_cache[form_id]
+
+        try:
+            print(f"[DEBUG] JotFormHelper.get_form_metadata - Fetching full metadata for form {form_id}")
+
+            # Get form properties
+            properties = self.client.get_form_properties(form_id)
+
+            # Get form questions to find vendor info
+            questions = self.client.get_form_questions(form_id)
+
+            metadata = {
+                'properties': properties,
+                'vendor': None,
+                'suppliers': [],
+                'notes': None,
+                'deadline': None,
+                'closing_date': None
+            }
+
+            # Try to extract vendor/supplier information and deadline from questions
+            for q_id, question in questions.items():
+                q_text = question.get('text', '').lower()
+                q_name = question.get('name', '').lower()
+
+                # Look for vendor/supplier fields
+                if 'vendor' in q_text or 'vendor' in q_name or 'supplier' in q_text or 'supplier' in q_name:
+                    # Check if it has a default value or text
+                    vendor_value = question.get('text', '') or question.get('defaultValue', '')
+                    if vendor_value and 'vendor' not in vendor_value.lower():
+                        metadata['vendor'] = vendor_value
+                        metadata['suppliers'].append(vendor_value)
+                        print(f"[DEBUG] JotFormHelper.get_form_metadata - Found vendor: {vendor_value}")
+
+                # Look for deadline/closing date
+                if any(keyword in q_text or keyword in q_name for keyword in ['deadline', 'close', 'closing', 'end date', 'due date']):
+                    deadline_value = question.get('text', '') or question.get('defaultValue', '')
+                    if deadline_value:
+                        metadata['deadline'] = deadline_value
+                        metadata['closing_date'] = deadline_value
+                        print(f"[DEBUG] JotFormHelper.get_form_metadata - Found deadline: {deadline_value}")
+
+                # Look for notes or additional info
+                if 'note' in q_text or 'note' in q_name or 'info' in q_text:
+                    metadata['notes'] = question.get('text', '')
+
+            # Also check form title for vendor info (sometimes included there)
+            form_title = properties.get('title', '')
+            if '-' in form_title or '|' in form_title:
+                # Sometimes vendors are in the title like "January GB - VendorName"
+                parts = form_title.replace('|', '-').split('-')
+                if len(parts) > 1:
+                    potential_vendor = parts[-1].strip()
+                    if potential_vendor and not any(month in potential_vendor.lower() for month in
+                        ['january', 'february', 'march', 'april', 'may', 'june',
+                         'july', 'august', 'september', 'october', 'november', 'december']):
+                        if not metadata['vendor']:
+                            metadata['vendor'] = potential_vendor
+                        if potential_vendor not in metadata['suppliers']:
+                            metadata['suppliers'].append(potential_vendor)
+
+            self.form_metadata_cache[form_id] = metadata
+            print(f"[DEBUG] JotFormHelper.get_form_metadata - Cached metadata for {form_id}: vendor={metadata['vendor']}, suppliers={metadata['suppliers']}, deadline={metadata['deadline']}")
+            return metadata
+
+        except Exception as e:
+            print(f"[ERROR] JotFormHelper.get_form_metadata - Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'properties': {}, 'vendor': None, 'suppliers': [], 'notes': None, 'deadline': None, 'closing_date': None}
     def find_form_by_month(self, month):
         # Find a form that matches a month name
         forms = self.get_all_forms()
@@ -97,10 +173,10 @@ class JotFormHelper:
             print(f"Description: {product.get('description', 'N/A')[:100]}...")
             print("-" * 60)
 
-def generate_answer_with_products(user_question, form_title, products):
+def generate_answer_with_products(user_question, form_title, products, vendor_info=None):
     """
     Uses ChatGPT to generate a natural conversational answer to the user's question
-    based on the available products.
+    based on the available products and form metadata.
     """
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
@@ -122,26 +198,45 @@ def generate_answer_with_products(user_question, form_title, products):
 
         products_text += "\n"
 
+    # Add vendor information if available
+    vendor_text = ""
+    if vendor_info:
+        if vendor_info.get('vendor'):
+            vendor_text += f"\nVendor/Supplier: {vendor_info['vendor']}"
+        elif vendor_info.get('suppliers'):
+            vendors_list = ', '.join(vendor_info['suppliers'])
+            vendor_text += f"\nVendors/Suppliers: {vendors_list}"
+
+    # Add deadline information if available
+    deadline_text = ""
+    if vendor_info and vendor_info.get('deadline'):
+        deadline_text = f"\nDeadline/Closing Date: {vendor_info['deadline']}"
+
     prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community. A user has asked a question about products in a Group Buy form.
 
-Form: {form_title}
+Form: {form_title}{vendor_text}{deadline_text}
 
 Available Products:
 {products_text}
 
 User's Question: "{user_question}"
 
-Please provide a helpful, conversational answer to the user's question based on the products listed above.
+Please provide a helpful, conversational answer to the user's question based on the products and information listed above.
 
 Guidelines:
 - Be friendly and conversational
 - Answer their specific question directly
 - If they ask about specific products, provide details about those products
+- If they ask about vendor/supplier, provide that information if available
+- If they ask when the GB closes/ends or about the deadline, provide the deadline/closing date if available
 - If they ask general questions like "what's available", give an overview
 - If they ask about prices, include pricing information
 - If they ask about MOQ (Minimum Order Quantity), stock, or quantity information, provide that data if available
 - If MOQ information is in the description field, extract and present it clearly
+- If the question mentions product abbreviations or nicknames (like "Reta" for "Retatrutide", "R30" for any product with 30 in the name), try to match them to the actual product names and provide info
+- If a product name is too vague or could match multiple products, ask the user to be more specific
 - If they ask about something not in the product list, politely let them know it's not available in this form
+- If they ask about delivery timeline or "how long will it take", answer: "Due to the volume of GBs, standard production times, shipping speeds, and custom processing timeframes, we estimate that you will receive your items in 4-8 weeks. This timeframe is subject to change if any of the following scenarios apply: Custom made batches, Package Seizures/Reships, International Shipping. Please DM an admin if you have any further questions."
 - Keep your response concise but informative
 - Use a natural, helpful tone like you're talking to a friend"""
 
@@ -159,10 +254,101 @@ Guidelines:
 
     return answer
 
+def check_for_coa_test_question(message_text):
+    """
+    Detect if user is asking about COA, test results, or certificates of analysis.
+    Returns True if this is a COA/test question that should be redirected to admins.
+    """
+    message_lower = message_text.lower()
+
+    # Keywords that indicate COA/test questions
+    coa_keywords = [
+        'coa', 'certificate of analysis', 'test result', 'test report',
+        'lab test', 'lab result', 'testing', 'purity test', 'quality test',
+        'third party test', 'janoshik', 'jano test'
+    ]
+
+    # Check if message contains any COA-related keywords
+    for keyword in coa_keywords:
+        if keyword in message_lower:
+            print(f"[DEBUG] check_for_coa_test_question - COA/test question detected: keyword '{keyword}' found")
+            return True
+
+    return False
+
+def get_admin_redirect_message():
+    """
+    Returns the standard message redirecting users to admins for COA/test questions.
+    """
+    return """I don't have access to external links or vendor test reports. Please DM an admin:
+- @Emilycarolinemarch
+- @Davesauce
+
+Or post your question in the Telegram group for further support."""
+
+def fuzzy_match_product_name(message_lower, product_name_lower):
+    """
+    Fuzzy match product names to handle abbreviations and variations.
+    Examples: 'Retatrutide 30' matches 'Reta 30', 'R30', 'Rita 30', etc.
+    """
+    # Extract key parts from product name (first significant word + numbers)
+    import re
+
+    # Get all numbers from the product name
+    product_numbers = re.findall(r'\d+', product_name_lower)
+
+    # Get first word (usually the main product name)
+    product_words = product_name_lower.split()
+    if not product_words:
+        return 0
+
+    main_word = product_words[0]
+
+    # Score the match
+    score = 0
+
+    # Check for exact match
+    if product_name_lower in message_lower:
+        return 10  # Highest score
+
+    # Check if numbers match (important for dosages like "30", "50", "100")
+    numbers_in_message = re.findall(r'\d+', message_lower)
+    if product_numbers and all(num in numbers_in_message for num in product_numbers):
+        score += 3
+
+    # Check for abbreviation matches
+    # For "Retatrutide", match "Reta", "R", "Rita", "Retrograde"
+    if len(main_word) >= 4:
+        # Check for prefixes of various lengths
+        for prefix_len in [1, 2, 3, 4, 5]:
+            if prefix_len <= len(main_word):
+                prefix = main_word[:prefix_len]
+                # Match as whole word or followed by space/number
+                if re.search(r'\b' + re.escape(prefix) + r'(?:\s|\d|$)', message_lower):
+                    score += min(prefix_len, 3)  # Longer matches get higher scores
+
+    # Check if the main word appears anywhere (fuzzy)
+    if main_word in message_lower:
+        score += 2
+
+    # Check for common substitutions (l->r, etc.)
+    # "Rita" for "Reta"
+    variations = [
+        main_word.replace('e', 'i'),
+        main_word.replace('i', 'e'),
+        main_word.replace('o', 'a'),
+        main_word.replace('a', 'o'),
+    ]
+    for var in variations:
+        if var in message_lower and len(var) > 3:
+            score += 1
+
+    return score
+
 def find_form_by_product_names(message_text, available_forms):
     """
     Search through products in all forms to find which form contains
-    products mentioned in the user's message.
+    products mentioned in the user's message. Uses fuzzy matching for product names.
     """
     print(f"[DEBUG] find_form_by_product_names - Searching for products in message: '{message_text}'")
 
@@ -176,46 +362,38 @@ def find_form_by_product_names(message_text, available_forms):
             if not products:
                 continue
 
-            matches = 0
+            total_score = 0
             matched_products = []
 
             # Check if any product names appear in the user's message
             for product in products:
-                product_name = product.get('name', '').lower()
-                if not product_name or product_name == 'n/a':
+                product_name = product.get('name', '')
+                if not product_name or product_name == 'N/A':
                     continue
 
-                # Check for exact or partial matches
-                # Split product name into words and check if they appear in the message
-                product_words = product_name.split()
+                product_name_lower = product_name.lower()
 
-                # Check if the full product name is in the message
-                if product_name in message_lower:
-                    matches += 2  # Full match is worth more
-                    matched_products.append(product.get('name'))
-                    print(f"[DEBUG] find_form_by_product_names - Full match: '{product.get('name')}' in form {form_id}")
-                # Check if significant words from product name appear
-                elif len(product_words) >= 2:
-                    # For multi-word products, check if at least 2 words match
-                    word_matches = sum(1 for word in product_words if len(word) > 3 and word in message_lower)
-                    if word_matches >= 2:
-                        matches += 1
-                        matched_products.append(product.get('name'))
-                        print(f"[DEBUG] find_form_by_product_names - Partial match: '{product.get('name')}' in form {form_id}")
+                # Use fuzzy matching
+                match_score = fuzzy_match_product_name(message_lower, product_name_lower)
 
-            if matches > 0:
+                if match_score > 0:
+                    total_score += match_score
+                    matched_products.append(product_name)
+                    print(f"[DEBUG] find_form_by_product_names - Match score {match_score}: '{product_name}' in form {form_id}")
+
+            if total_score > 0:
                 form_matches[form_id] = {
-                    'score': matches,
+                    'score': total_score,
                     'products': matched_products,
                     'title': form_data.get('title')
                 }
-                print(f"[DEBUG] find_form_by_product_names - Form {form_id} ({form_data.get('title')}) has {matches} matches")
+                print(f"[DEBUG] find_form_by_product_names - Form {form_id} ({form_data.get('title')}) has total score {total_score}")
 
         except Exception as e:
             print(f"[DEBUG] find_form_by_product_names - Error checking form {form_id}: {e}")
             continue
 
-    # Return the form with the most matches
+    # Return the form with the highest score
     if form_matches:
         best_match = max(form_matches.items(), key=lambda x: x[1]['score'])
         form_id = best_match[0]
@@ -298,11 +476,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     text_lower = text.lower()
 
+    # Check if this is a COA/test result question - redirect to admins
+    if check_for_coa_test_question(text):
+        print(f"[DEBUG] handle_message - COA/test question detected, redirecting to admins")
+        await update.message.reply_text(get_admin_redirect_message())
+        return
+
     # Handle timeline questions
     if 'how long' in text_lower or 'timeline' in text_lower or 'timeframe' in text_lower:
         await update.message.reply_text(
-            "On average, GBs take around 4-8 weeks to be completed. This timeframe does not include vendor production on custom-made batches, custom delays, or seizures. International shipping from the GBO to members can take longer.\n"
-            "Use /help for more commands!"
+            "Due to the volume of GBs, standard production times, shipping speeds, and custom processing timeframes, we estimate that you will receive your items in 4-8 weeks. This timeframe is subject to change if any of the following scenarios apply:\n"
+            "- Custom made batches\n"
+            "- Package Seizures/Reships\n"
+            "- International Shipping\n\n"
+            "Please DM an admin if you have any further questions."
         )
         return
 
@@ -326,13 +513,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"[DEBUG] handle_message - Retrieved {len(products) if products else 0} products")
 
             if products:
-                # Get form title
+                # Get form title and metadata (including vendor info)
                 form_title = available_forms.get(form_id, {}).get('title', 'Group Buy')
+
+                print(f"[DEBUG] handle_message - Fetching form metadata for vendor info")
+                vendor_info = jotform_helper.get_form_metadata(form_id)
 
                 print(f"[DEBUG] handle_message - Generating conversational answer with ChatGPT")
 
                 # Use ChatGPT to generate a natural answer to the user's question
-                answer = generate_answer_with_products(text, form_title, products)
+                answer = generate_answer_with_products(text, form_title, products, vendor_info)
 
                 print(f"[DEBUG] handle_message - Sending answer to user")
                 await update.message.reply_text(answer)
