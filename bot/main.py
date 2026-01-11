@@ -67,11 +67,21 @@ class JotFormHelper:
     def clean_products(self, products):
         clean_products_list = []
         for product in products:
-            clean_products_list.append({
+            product_data = {
                 'name': product.get('name', 'N/A'),
                 'price': product.get('price', 'N/A'),
                 'description': product.get('description', 'N/A')
-            })
+            }
+
+            # Try to extract MOQ and other potentially useful fields
+            if 'quantity' in product:
+                product_data['quantity'] = product.get('quantity')
+            if 'moq' in product:
+                product_data['moq'] = product.get('moq')
+            if 'stock' in product:
+                product_data['stock'] = product.get('stock')
+
+            clean_products_list.append(product_data)
         return clean_products_list
         
     def print_products(self, form_id):
@@ -100,7 +110,17 @@ def generate_answer_with_products(user_question, form_title, products):
         name = product.get('name', 'N/A')
         price = product.get('price', 'N/A')
         description = product.get('description', 'N/A')
-        products_text += f"{idx}. {name}\n   Price: ${price}\n   Description: {description}\n\n"
+        products_text += f"{idx}. {name}\n   Price: ${price}\n   Description: {description}\n"
+
+        # Add MOQ and other fields if available
+        if 'moq' in product:
+            products_text += f"   MOQ (Minimum Order Quantity): {product['moq']}\n"
+        if 'quantity' in product:
+            products_text += f"   Quantity: {product['quantity']}\n"
+        if 'stock' in product:
+            products_text += f"   Stock: {product['stock']}\n"
+
+        products_text += "\n"
 
     prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community. A user has asked a question about products in a Group Buy form.
 
@@ -119,6 +139,8 @@ Guidelines:
 - If they ask about specific products, provide details about those products
 - If they ask general questions like "what's available", give an overview
 - If they ask about prices, include pricing information
+- If they ask about MOQ (Minimum Order Quantity), stock, or quantity information, provide that data if available
+- If MOQ information is in the description field, extract and present it clearly
 - If they ask about something not in the product list, politely let them know it's not available in this form
 - Keep your response concise but informative
 - Use a natural, helpful tone like you're talking to a friend"""
@@ -136,6 +158,73 @@ Guidelines:
     print(f"[DEBUG] generate_answer_with_products - Generated answer length: {len(answer)} chars")
 
     return answer
+
+def find_form_by_product_names(message_text, available_forms):
+    """
+    Search through products in all forms to find which form contains
+    products mentioned in the user's message.
+    """
+    print(f"[DEBUG] find_form_by_product_names - Searching for products in message: '{message_text}'")
+
+    message_lower = message_text.lower()
+    form_matches = {}  # form_id -> number of product matches
+
+    for form_id, form_data in available_forms.items():
+        try:
+            # Get products for this form
+            products = jotform_helper.get_products(form_id)
+            if not products:
+                continue
+
+            matches = 0
+            matched_products = []
+
+            # Check if any product names appear in the user's message
+            for product in products:
+                product_name = product.get('name', '').lower()
+                if not product_name or product_name == 'n/a':
+                    continue
+
+                # Check for exact or partial matches
+                # Split product name into words and check if they appear in the message
+                product_words = product_name.split()
+
+                # Check if the full product name is in the message
+                if product_name in message_lower:
+                    matches += 2  # Full match is worth more
+                    matched_products.append(product.get('name'))
+                    print(f"[DEBUG] find_form_by_product_names - Full match: '{product.get('name')}' in form {form_id}")
+                # Check if significant words from product name appear
+                elif len(product_words) >= 2:
+                    # For multi-word products, check if at least 2 words match
+                    word_matches = sum(1 for word in product_words if len(word) > 3 and word in message_lower)
+                    if word_matches >= 2:
+                        matches += 1
+                        matched_products.append(product.get('name'))
+                        print(f"[DEBUG] find_form_by_product_names - Partial match: '{product.get('name')}' in form {form_id}")
+
+            if matches > 0:
+                form_matches[form_id] = {
+                    'score': matches,
+                    'products': matched_products,
+                    'title': form_data.get('title')
+                }
+                print(f"[DEBUG] find_form_by_product_names - Form {form_id} ({form_data.get('title')}) has {matches} matches")
+
+        except Exception as e:
+            print(f"[DEBUG] find_form_by_product_names - Error checking form {form_id}: {e}")
+            continue
+
+    # Return the form with the most matches
+    if form_matches:
+        best_match = max(form_matches.items(), key=lambda x: x[1]['score'])
+        form_id = best_match[0]
+        match_info = best_match[1]
+        print(f"[DEBUG] find_form_by_product_names - Best match: {form_id} ({match_info['title']}) with products: {match_info['products']}")
+        return form_id
+
+    print(f"[DEBUG] find_form_by_product_names - No product matches found")
+    return None
 
 def analyze_message_for_gb(message_text, available_forms):
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -189,10 +278,13 @@ Do not include any other text, explanation, or formatting."""
     elif result != "UNCLEAR":
         print(f"[DEBUG] ✗ Form ID '{result}' NOT found in available forms")
         print(f"[DEBUG] Available form IDs: {list(available_forms.keys())}")
-        return None
+        # Try product-based search as fallback
+        print(f"[DEBUG] Trying product-based search as fallback...")
+        return find_form_by_product_names(message_text, available_forms)
     else:
-        print(f"[DEBUG] ChatGPT returned UNCLEAR")
-        return None
+        print(f"[DEBUG] ChatGPT returned UNCLEAR, trying product-based search as fallback...")
+        # Try to find form by searching for product names in the message
+        return find_form_by_product_names(message_text, available_forms)
 
 # Initialize global JotFormHelper instance
 jotform_helper = JotFormHelper()
