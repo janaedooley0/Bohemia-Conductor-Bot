@@ -54,10 +54,12 @@ class JotFormHelper:
                 'properties': properties,
                 'vendor': None,
                 'suppliers': [],
-                'notes': None
+                'notes': None,
+                'deadline': None,
+                'closing_date': None
             }
 
-            # Try to extract vendor/supplier information from questions
+            # Try to extract vendor/supplier information and deadline from questions
             for q_id, question in questions.items():
                 q_text = question.get('text', '').lower()
                 q_name = question.get('name', '').lower()
@@ -70,6 +72,14 @@ class JotFormHelper:
                         metadata['vendor'] = vendor_value
                         metadata['suppliers'].append(vendor_value)
                         print(f"[DEBUG] JotFormHelper.get_form_metadata - Found vendor: {vendor_value}")
+
+                # Look for deadline/closing date
+                if any(keyword in q_text or keyword in q_name for keyword in ['deadline', 'close', 'closing', 'end date', 'due date']):
+                    deadline_value = question.get('text', '') or question.get('defaultValue', '')
+                    if deadline_value:
+                        metadata['deadline'] = deadline_value
+                        metadata['closing_date'] = deadline_value
+                        print(f"[DEBUG] JotFormHelper.get_form_metadata - Found deadline: {deadline_value}")
 
                 # Look for notes or additional info
                 if 'note' in q_text or 'note' in q_name or 'info' in q_text:
@@ -91,14 +101,14 @@ class JotFormHelper:
                             metadata['suppliers'].append(potential_vendor)
 
             self.form_metadata_cache[form_id] = metadata
-            print(f"[DEBUG] JotFormHelper.get_form_metadata - Cached metadata for {form_id}: vendor={metadata['vendor']}, suppliers={metadata['suppliers']}")
+            print(f"[DEBUG] JotFormHelper.get_form_metadata - Cached metadata for {form_id}: vendor={metadata['vendor']}, suppliers={metadata['suppliers']}, deadline={metadata['deadline']}")
             return metadata
 
         except Exception as e:
             print(f"[ERROR] JotFormHelper.get_form_metadata - Error: {e}")
             import traceback
             traceback.print_exc()
-            return {'properties': {}, 'vendor': None, 'suppliers': [], 'notes': None}
+            return {'properties': {}, 'vendor': None, 'suppliers': [], 'notes': None, 'deadline': None, 'closing_date': None}
     def find_form_by_month(self, month):
         # Find a form that matches a month name
         forms = self.get_all_forms()
@@ -197,9 +207,14 @@ def generate_answer_with_products(user_question, form_title, products, vendor_in
             vendors_list = ', '.join(vendor_info['suppliers'])
             vendor_text += f"\nVendors/Suppliers: {vendors_list}"
 
+    # Add deadline information if available
+    deadline_text = ""
+    if vendor_info and vendor_info.get('deadline'):
+        deadline_text = f"\nDeadline/Closing Date: {vendor_info['deadline']}"
+
     prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community. A user has asked a question about products in a Group Buy form.
 
-Form: {form_title}{vendor_text}
+Form: {form_title}{vendor_text}{deadline_text}
 
 Available Products:
 {products_text}
@@ -213,6 +228,7 @@ Guidelines:
 - Answer their specific question directly
 - If they ask about specific products, provide details about those products
 - If they ask about vendor/supplier, provide that information if available
+- If they ask when the GB closes/ends or about the deadline, provide the deadline/closing date if available
 - If they ask general questions like "what's available", give an overview
 - If they ask about prices, include pricing information
 - If they ask about MOQ (Minimum Order Quantity), stock, or quantity information, provide that data if available
@@ -220,6 +236,7 @@ Guidelines:
 - If the question mentions product abbreviations or nicknames (like "Reta" for "Retatrutide", "R30" for any product with 30 in the name), try to match them to the actual product names and provide info
 - If a product name is too vague or could match multiple products, ask the user to be more specific
 - If they ask about something not in the product list, politely let them know it's not available in this form
+- If they ask about delivery timeline or "how long will it take", answer: "Due to the volume of GBs, standard production times, shipping speeds, and custom processing timeframes, we estimate that you will receive your items in 4-8 weeks. This timeframe is subject to change if any of the following scenarios apply: Custom made batches, Package Seizures/Reships, International Shipping. Please DM an admin if you have any further questions."
 - Keep your response concise but informative
 - Use a natural, helpful tone like you're talking to a friend"""
 
@@ -236,6 +253,38 @@ Guidelines:
     print(f"[DEBUG] generate_answer_with_products - Generated answer length: {len(answer)} chars")
 
     return answer
+
+def check_for_coa_test_question(message_text):
+    """
+    Detect if user is asking about COA, test results, or certificates of analysis.
+    Returns True if this is a COA/test question that should be redirected to admins.
+    """
+    message_lower = message_text.lower()
+
+    # Keywords that indicate COA/test questions
+    coa_keywords = [
+        'coa', 'certificate of analysis', 'test result', 'test report',
+        'lab test', 'lab result', 'testing', 'purity test', 'quality test',
+        'third party test', 'janoshik', 'jano test'
+    ]
+
+    # Check if message contains any COA-related keywords
+    for keyword in coa_keywords:
+        if keyword in message_lower:
+            print(f"[DEBUG] check_for_coa_test_question - COA/test question detected: keyword '{keyword}' found")
+            return True
+
+    return False
+
+def get_admin_redirect_message():
+    """
+    Returns the standard message redirecting users to admins for COA/test questions.
+    """
+    return """I don't have access to external links or vendor test reports. Please DM an admin:
+- @Emilycarolinemarch
+- @Davesauce
+
+Or post your question in the Telegram group for further support."""
 
 def fuzzy_match_product_name(message_lower, product_name_lower):
     """
@@ -427,11 +476,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     text_lower = text.lower()
 
+    # Check if this is a COA/test result question - redirect to admins
+    if check_for_coa_test_question(text):
+        print(f"[DEBUG] handle_message - COA/test question detected, redirecting to admins")
+        await update.message.reply_text(get_admin_redirect_message())
+        return
+
     # Handle timeline questions
     if 'how long' in text_lower or 'timeline' in text_lower or 'timeframe' in text_lower:
         await update.message.reply_text(
-            "On average, GBs take around 4-8 weeks to be completed. This timeframe does not include vendor production on custom-made batches, custom delays, or seizures. International shipping from the GBO to members can take longer.\n"
-            "Use /help for more commands!"
+            "Due to the volume of GBs, standard production times, shipping speeds, and custom processing timeframes, we estimate that you will receive your items in 4-8 weeks. This timeframe is subject to change if any of the following scenarios apply:\n"
+            "- Custom made batches\n"
+            "- Package Seizures/Reships\n"
+            "- International Shipping\n\n"
+            "Please DM an admin if you have any further questions."
         )
         return
 
