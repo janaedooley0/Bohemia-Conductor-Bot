@@ -229,6 +229,8 @@ CRITICAL INSTRUCTIONS:
 - Match product abbreviations (Reta=Retatrutide, R30=products with 30, etc.)
 - For ambiguous product names, ask for clarification
 - For timeline questions: "4-8 weeks depending on customs, production, and shipping. Subject to delays for custom batches, seizures, or international shipping."
+- IMPORTANT: The Description field contains critical information including MOQ, lab details, testing info, and vendor specifics - ALWAYS read and use this information when answering questions
+- If asked about MOQ, lab info, testing, or vendor details, search the Description field carefully
 - Keep responses SHORT and direct"""
 
     print(f"[DEBUG] generate_answer_with_products - Generating answer for: '{user_question}'")
