@@ -1,4 +1,5 @@
 import os
+import time
 from dotenv import load_dotenv
 from openai import OpenAI
 from jotform import JotformAPIClient
@@ -8,6 +9,112 @@ import json
 import re
 
 load_dotenv()
+
+# Cache TTL configuration (default: 5 minutes)
+CACHE_TTL_SECONDS = int(os.getenv('CACHE_TTL_SECONDS', 300))
+
+# =============================================================================
+# STATIC FAQ SYSTEM
+# =============================================================================
+# Common questions and answers that don't require JotForm/API lookups
+FAQ_DATABASE = {
+    # Group Buy Basics
+    "what is a group buy": {
+        "keywords": ["what is a group buy", "what's a group buy", "what is gb", "what's a gb", "explain group buy", "how does group buy work", "how do group buys work"],
+        "answer": "A Group Buy (GB) is a collective purchasing arrangement where multiple buyers pool their orders together to get better pricing from vendors. By ordering in bulk as a group, we can negotiate lower prices than individual orders would receive. Each GB typically has a deadline for orders and an estimated delivery timeframe."
+    },
+    "what is bohemia": {
+        "keywords": ["what is bohemia", "what's bohemia", "who is bohemia", "about bohemia"],
+        "answer": "Bohemia is a Group Buy community that organizes collective purchases to help members get better pricing on products. We coordinate orders, handle vendor relationships, and manage the distribution process."
+    },
+
+    # Order Process
+    "how to order": {
+        "keywords": ["how to order", "how do i order", "how can i order", "place an order", "make an order", "ordering process", "how to place order", "how to buy", "how do i buy"],
+        "answer": "To place an order:\n1. Find the current Group Buy form (ask about the 'current GB')\n2. Fill out the JotForm with your product selections\n3. Submit your order before the deadline\n4. Follow the payment instructions provided\n5. Wait for shipping confirmation\n\nIf you need help with a specific step, please ask!"
+    },
+    "how to pay": {
+        "keywords": ["how to pay", "payment method", "payment options", "how do i pay", "accepted payment", "pay for order", "payment instructions"],
+        "answer": "Payment instructions are provided after you submit your order form. Typically, payment details will be sent via DM or included in the order confirmation. If you haven't received payment instructions after submitting your order, please DM an admin:\n- @Emilycarolinemarch\n- @Davesauce"
+    },
+
+    # Shipping & Delivery
+    "shipping info": {
+        "keywords": ["shipping", "ship to", "delivery", "where do you ship", "shipping countries", "international shipping", "do you ship to"],
+        "answer": "Shipping details vary by Group Buy and vendor. Generally:\n- Shipping is handled after the GB closes and products are received\n- International shipping is available but may have longer delivery times\n- Tracking information is provided when available\n\nFor specific shipping questions about your order, please DM an admin."
+    },
+    "package seized": {
+        "keywords": ["seized", "customs", "package seized", "confiscated", "customs issue", "stopped at customs", "lost package"],
+        "answer": "If your package is seized by customs:\n1. Don't panic - this occasionally happens with international shipments\n2. Contact an admin immediately with your order details\n3. We'll work with you on reship options based on the situation\n\nPlease DM an admin:\n- @Emilycarolinemarch\n- @Davesauce"
+    },
+
+    # Policies
+    "refund policy": {
+        "keywords": ["refund", "money back", "return", "cancel order", "cancellation", "get refund"],
+        "answer": "Refund and cancellation policies vary by Group Buy. Generally:\n- Orders can be modified/cancelled before the GB deadline\n- After the deadline, changes may not be possible as orders are already placed with vendors\n- Issues with received products are handled case-by-case\n\nFor specific refund requests, please DM an admin with your order details."
+    },
+    "minimum order": {
+        "keywords": ["minimum order", "min order", "moq", "minimum quantity", "minimum purchase", "smallest order"],
+        "answer": "Minimum Order Quantities (MOQ) vary by product and are listed in each product's description on the order form. Some products have no minimum, while others require a minimum quantity to be ordered. Check the specific product listing for MOQ details."
+    },
+
+    # Contact & Support
+    "contact admin": {
+        "keywords": ["contact", "admin", "support", "help", "who to contact", "dm admin", "talk to admin", "speak to admin", "customer service"],
+        "answer": "For support, please DM one of our admins:\n- @Emilycarolinemarch\n- @Davesauce\n\nOr post your question in the Telegram group for community assistance."
+    },
+    "group rules": {
+        "keywords": ["rules", "group rules", "guidelines", "what are the rules", "community rules"],
+        "answer": "Please refer to the pinned messages in the Telegram group for the full list of community rules and guidelines. Key points:\n- Be respectful to all members\n- No spam or self-promotion\n- Keep discussions on-topic\n- Follow admin instructions\n\nViolations may result in warnings or removal from the group."
+    },
+
+    # Product & Quality
+    "quality assurance": {
+        "keywords": ["quality", "legit", "legitimate", "real", "authentic", "trustworthy", "safe", "is this safe", "is this legit"],
+        "answer": "We work with verified vendors and many products come with Certificates of Analysis (COA) or third-party test results. For specific product testing information, please DM an admin:\n- @Emilycarolinemarch\n- @Davesauce"
+    },
+
+    # Timing
+    "when next gb": {
+        "keywords": ["next gb", "next group buy", "upcoming gb", "future gb", "when is next", "new gb"],
+        "answer": "New Group Buys are announced in the Telegram group. Keep an eye on announcements and pinned messages for upcoming GBs. You can also ask about the 'current GB' to see what's available now."
+    },
+    "order status": {
+        "keywords": ["order status", "where is my order", "track order", "tracking", "order update", "when will i receive", "when does my order"],
+        "answer": "For order status updates:\n1. Check any tracking information provided to you\n2. Review announcements in the group for general GB updates\n3. For specific order inquiries, please DM an admin with your order details:\n   - @Emilycarolinemarch\n   - @Davesauce"
+    }
+}
+
+def check_faq_match(message_text):
+    """
+    Check if the user's message matches any FAQ entry.
+    Returns the FAQ answer if matched, None otherwise.
+    """
+    message_lower = message_text.lower().strip()
+
+    # Remove common question words for better matching
+    clean_message = message_lower
+    for word in ['can you tell me', 'could you tell me', 'please tell me', 'i want to know', 'i need to know', 'can you explain', 'please explain']:
+        clean_message = clean_message.replace(word, '')
+    clean_message = clean_message.strip()
+
+    best_match = None
+    best_score = 0
+
+    for faq_key, faq_data in FAQ_DATABASE.items():
+        for keyword in faq_data['keywords']:
+            # Check for exact keyword match
+            if keyword in message_lower or keyword in clean_message:
+                # Score based on keyword length (longer = more specific = better match)
+                score = len(keyword)
+                if score > best_score:
+                    best_score = score
+                    best_match = faq_data['answer']
+
+    if best_match:
+        print(f"[DEBUG] check_faq_match - FAQ match found with score {best_score}")
+
+    return best_match
 jotform = JotformAPIClient(os.getenv('JOTFORM_API_KEY'))
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
@@ -15,15 +122,49 @@ class JotFormHelper:
     def __init__(self):
         self.client = JotformAPIClient(os.getenv('JOTFORM_API_KEY'))
         self.forms_cache = {}
-        self.products_cache = {} #products are stored here
-        self.form_metadata_cache = {} # Store full form metadata including vendor info
+        self.products_cache = {}  # products are stored here
+        self.form_metadata_cache = {}  # Store full form metadata including vendor info
+        # Cache timestamps for TTL management
+        self.forms_cache_timestamp = 0
+        self.products_cache_timestamps = {}  # per-form timestamps
+        self.form_metadata_cache_timestamps = {}  # per-form timestamps
 
-    def get_all_forms(self):
-        # Get list of all forms
-        if not self.forms_cache:
-            print(f"[DEBUG] JotFormHelper.get_all_forms - Fetching forms from JotForm API")
+    def is_cache_expired(self, timestamp):
+        """Check if a cache entry has expired based on TTL."""
+        return (time.time() - timestamp) > CACHE_TTL_SECONDS
+
+    def clear_all_caches(self):
+        """Force clear all caches - useful for admin refresh commands."""
+        self.forms_cache = {}
+        self.products_cache = {}
+        self.form_metadata_cache = {}
+        self.forms_cache_timestamp = 0
+        self.products_cache_timestamps = {}
+        self.form_metadata_cache_timestamps = {}
+        print(f"[DEBUG] JotFormHelper.clear_all_caches - All caches cleared")
+
+    def get_all_forms(self, force_refresh=False):
+        """Get list of all forms with TTL-based caching."""
+        # Check if cache is valid
+        cache_valid = (
+            self.forms_cache and
+            not self.is_cache_expired(self.forms_cache_timestamp) and
+            not force_refresh
+        )
+
+        if cache_valid:
+            print(f"[DEBUG] JotFormHelper.get_all_forms - Using cached forms ({len(self.forms_cache)} forms, age: {int(time.time() - self.forms_cache_timestamp)}s)")
+            return self.forms_cache
+
+        # Cache expired or empty - fetch fresh data
+        print(f"[DEBUG] JotFormHelper.get_all_forms - Fetching forms from JotForm API (cache expired or forced refresh)")
+        try:
             forms = self.client.get_forms()
             print(f"[DEBUG] JotFormHelper.get_all_forms - Retrieved {len(forms)} forms from API")
+
+            # Clear old cache
+            self.forms_cache = {}
+
             for form in forms:
                 # Get latest submission date for each form
                 latest_submission = None
@@ -38,18 +179,37 @@ class JotFormHelper:
                 self.forms_cache[form['id']] = {
                     'id': form['id'],
                     'title': form['title'],
-                    'created': form.get('created_at',''),
-                    'latest_submission': latest_submission or form.get('created_at','')
+                    'created': form.get('created_at', ''),
+                    'latest_submission': latest_submission or form.get('created_at', '')
                 }
                 print(f"[DEBUG] JotFormHelper.get_all_forms - Added form: {form['id']} - {form['title']}")
-        else:
-            print(f"[DEBUG] JotFormHelper.get_all_forms - Using cached forms ({len(self.forms_cache)} forms)")
+
+            # Update cache timestamp
+            self.forms_cache_timestamp = time.time()
+            print(f"[DEBUG] JotFormHelper.get_all_forms - Cache refreshed at {self.forms_cache_timestamp}")
+
+        except Exception as e:
+            print(f"[ERROR] JotFormHelper.get_all_forms - Error fetching forms: {e}")
+            # If we have stale cache data, return it rather than nothing
+            if self.forms_cache:
+                print(f"[DEBUG] JotFormHelper.get_all_forms - Returning stale cache due to error")
+                return self.forms_cache
+            raise
+
         return self.forms_cache
 
-    def get_form_metadata(self, form_id):
-        """Get full form metadata including vendor, questions, and other properties"""
-        if form_id in self.form_metadata_cache:
-            print(f"[DEBUG] JotFormHelper.get_form_metadata - Using cached metadata for form {form_id}")
+    def get_form_metadata(self, form_id, force_refresh=False):
+        """Get full form metadata including vendor, questions, and other properties with TTL-based caching."""
+        # Check if cache is valid for this form
+        cache_timestamp = self.form_metadata_cache_timestamps.get(form_id, 0)
+        cache_valid = (
+            form_id in self.form_metadata_cache and
+            not self.is_cache_expired(cache_timestamp) and
+            not force_refresh
+        )
+
+        if cache_valid:
+            print(f"[DEBUG] JotFormHelper.get_form_metadata - Using cached metadata for form {form_id} (age: {int(time.time() - cache_timestamp)}s)")
             return self.form_metadata_cache[form_id]
 
         try:
@@ -111,7 +271,9 @@ class JotFormHelper:
                         if potential_vendor not in metadata['suppliers']:
                             metadata['suppliers'].append(potential_vendor)
 
+            # Update cache and timestamp
             self.form_metadata_cache[form_id] = metadata
+            self.form_metadata_cache_timestamps[form_id] = time.time()
             print(f"[DEBUG] JotFormHelper.get_form_metadata - Cached metadata for {form_id}: vendor={metadata['vendor']}, suppliers={metadata['suppliers']}, deadline={metadata['deadline']}")
             return metadata
 
@@ -119,6 +281,10 @@ class JotFormHelper:
             print(f"[ERROR] JotFormHelper.get_form_metadata - Error: {e}")
             import traceback
             traceback.print_exc()
+            # Return stale cache if available
+            if form_id in self.form_metadata_cache:
+                print(f"[DEBUG] JotFormHelper.get_form_metadata - Returning stale cache due to error")
+                return self.form_metadata_cache[form_id]
             return {'properties': {}, 'vendor': None, 'suppliers': [], 'notes': None, 'deadline': None, 'closing_date': None}
     def find_form_by_month(self, month):
         # Find a form that matches a month name
@@ -130,25 +296,42 @@ class JotFormHelper:
             if month_lower in title_lower and 'order' in title_lower:
                 return form_id
         return None
-    def get_products(self, form_id):
-        #Get products from a specific form
-        if form_id in self.products_cache:
-            print(f"[DEBUG] JotFormHelper.get_products - Using cached products for form {form_id}")
+    def get_products(self, form_id, force_refresh=False):
+        """Get products from a specific form with TTL-based caching."""
+        # Check if cache is valid for this form
+        cache_timestamp = self.products_cache_timestamps.get(form_id, 0)
+        cache_valid = (
+            form_id in self.products_cache and
+            not self.is_cache_expired(cache_timestamp) and
+            not force_refresh
+        )
+
+        if cache_valid:
+            print(f"[DEBUG] JotFormHelper.get_products - Using cached products for form {form_id} (age: {int(time.time() - cache_timestamp)}s)")
             return self.products_cache[form_id]
 
         try:
-            print(f"[DEBUG] JotFormHelper.get_products - Fetching properties for form {form_id}")
+            print(f"[DEBUG] JotFormHelper.get_products - Fetching properties for form {form_id} (cache expired or forced refresh)")
             properties = self.client.get_form_properties(form_id)
             raw_products = properties.get('products', [])
             print(f"[DEBUG] JotFormHelper.get_products - Raw products count: {len(raw_products)}")
             clean_products = self.clean_products(raw_products)
             print(f"[DEBUG] JotFormHelper.get_products - Clean products count: {len(clean_products)}")
+
+            # Update cache and timestamp
             self.products_cache[form_id] = clean_products
+            self.products_cache_timestamps[form_id] = time.time()
+            print(f"[DEBUG] JotFormHelper.get_products - Cache refreshed for form {form_id}")
+
             return clean_products
         except Exception as e:
             print(f"[ERROR] JotFormHelper.get_products - Error fetching products: {e}")
             import traceback
             traceback.print_exc()
+            # Return stale cache if available
+            if form_id in self.products_cache:
+                print(f"[DEBUG] JotFormHelper.get_products - Returning stale cache due to error")
+                return self.products_cache[form_id]
             return []
         
     def clean_products(self, products):
@@ -473,11 +656,63 @@ Do not include any other text, explanation, or formatting."""
 # Initialize global JotFormHelper instance
 jotform_helper = JotFormHelper()
 
-# Start/Welcome Message
+# =============================================================================
+# BOT COMMAND HANDLERS
+# =============================================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hello there! I'm Bohemia's Steward. I'm alive!")
+    """Welcome message for new users."""
+    await update.message.reply_text(
+        "Hello! I'm Bohemia's Steward, your Group Buy assistant.\n\n"
+        "I can help you with:\n"
+        "- Product information from current GBs\n"
+        "- Common questions (how to order, shipping, etc.)\n"
+        "- Finding the right Group Buy form\n\n"
+        "Just ask me a question, or use /help to see available commands!"
+    )
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Available commands:\n/start - Say hello\n/help - Show this message")
+    """Show available commands and how to use the bot."""
+    await update.message.reply_text(
+        "Available commands:\n"
+        "/start - Welcome message\n"
+        "/help - Show this message\n"
+        "/faq - Show frequently asked questions\n"
+        "/refresh - Refresh cached data (admin)\n\n"
+        "You can also just ask me questions like:\n"
+        "- 'What products are in the current GB?'\n"
+        "- 'How do I place an order?'\n"
+        "- 'What's the price of Retatrutide?'\n"
+        "- 'How long does shipping take?'"
+    )
+
+async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show list of FAQ topics."""
+    faq_topics = [
+        "- What is a Group Buy?",
+        "- How do I place an order?",
+        "- How do I pay?",
+        "- How long does shipping take?",
+        "- What if my package is seized?",
+        "- What's the refund policy?",
+        "- What's the minimum order?",
+        "- How do I contact an admin?",
+        "- What are the group rules?",
+        "- When is the next GB?"
+    ]
+    await update.message.reply_text(
+        "Frequently Asked Questions:\n\n" +
+        "\n".join(faq_topics) +
+        "\n\nJust ask me any of these questions for more details!"
+    )
+
+async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to refresh cached data."""
+    jotform_helper.clear_all_caches()
+    await update.message.reply_text(
+        "Cache cleared! Fresh data will be fetched on the next request.\n"
+        f"Cache TTL is set to {CACHE_TTL_SECONDS} seconds."
+    )
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     text_lower = text.lower()
@@ -486,6 +721,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if check_for_coa_test_question(text):
         print(f"[DEBUG] handle_message - COA/test question detected, redirecting to admins")
         await update.message.reply_text(get_admin_redirect_message())
+        return
+
+    # Check FAQ database first (fast, no API calls needed)
+    faq_answer = check_faq_match(text)
+    if faq_answer:
+        print(f"[DEBUG] handle_message - FAQ match found, returning static answer")
+        await update.message.reply_text(faq_answer)
         return
 
     # Handle timeline questions
@@ -553,10 +795,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 def main():
     app = Application.builder().token(TOKEN).build()
+
+    # Register command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("faq", faq_command))
+    app.add_handler(CommandHandler("refresh", refresh_command))
+
+    # Register message handler for non-command messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot is running...")
+
+    print(f"Bot is running... (Cache TTL: {CACHE_TTL_SECONDS}s)")
     app.run_polling()
 
 if __name__ == '__main__':
