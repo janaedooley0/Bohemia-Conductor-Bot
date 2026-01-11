@@ -212,41 +212,32 @@ def generate_answer_with_products(user_question, form_title, products, vendor_in
     if vendor_info and vendor_info.get('deadline'):
         deadline_text = f"\nDeadline/Closing Date: {vendor_info['deadline']}"
 
-    prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community. A user has asked a question about products in a Group Buy form.
+    prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community.
 
 Form: {form_title}{vendor_text}{deadline_text}
 
-Available Products:
+Products:
 {products_text}
 
-User's Question: "{user_question}"
+User asked: "{user_question}"
 
-Please provide a helpful, conversational answer to the user's question based on the products and information listed above.
-
-Guidelines:
-- Be friendly and conversational
-- Answer their specific question directly
-- If they ask about specific products, provide details about those products
-- If they ask about vendor/supplier, provide that information if available
-- If they ask when the GB closes/ends or about the deadline, provide the deadline/closing date if available
-- If they ask general questions like "what's available", give an overview
-- If they ask about prices, include pricing information
-- If they ask about MOQ (Minimum Order Quantity), stock, or quantity information, provide that data if available
-- If MOQ information is in the description field, extract and present it clearly
-- If the question mentions product abbreviations or nicknames (like "Reta" for "Retatrutide", "R30" for any product with 30 in the name), try to match them to the actual product names and provide info
-- If a product name is too vague or could match multiple products, ask the user to be more specific
-- If they ask about something not in the product list, politely let them know it's not available in this form
-- If they ask about delivery timeline or "how long will it take", answer: "Due to the volume of GBs, standard production times, shipping speeds, and custom processing timeframes, we estimate that you will receive your items in 4-8 weeks. This timeframe is subject to change if any of the following scenarios apply: Custom made batches, Package Seizures/Reships, International Shipping. Please DM an admin if you have any further questions."
-- Keep your response concise but informative
-- Use a natural, helpful tone like you're talking to a friend"""
+CRITICAL INSTRUCTIONS:
+- ONLY answer the specific question asked - don't volunteer extra information
+- If they ask a vague question like "What about X GB?", ask what specifically they want to know
+- Be conversational and natural - vary your tone and style
+- Don't follow a rigid format or template - be creative with your responses
+- Match product abbreviations (Reta=Retatrutide, R30=products with 30, etc.)
+- For ambiguous product names, ask for clarification
+- For timeline questions: "4-8 weeks depending on customs, production, and shipping. Subject to delays for custom batches, seizures, or international shipping."
+- Keep responses SHORT and direct"""
 
     print(f"[DEBUG] generate_answer_with_products - Generating answer for: '{user_question}'")
     print(f"[DEBUG] generate_answer_with_products - Using {len(products)} products")
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+        temperature=0.95
     )
 
     answer = response.choices[0].message.content.strip()
@@ -441,7 +432,7 @@ Do not include any other text, explanation, or formatting."""
     print(f"[DEBUG] Forms list sent to ChatGPT:\n{forms_list}\n")
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
