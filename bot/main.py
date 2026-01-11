@@ -87,6 +87,56 @@ class JotFormHelper:
             print(f"Description: {product.get('description', 'N/A')[:100]}...")
             print("-" * 60)
 
+def generate_answer_with_products(user_question, form_title, products):
+    """
+    Uses ChatGPT to generate a natural conversational answer to the user's question
+    based on the available products.
+    """
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+    # Format products as a clean list for ChatGPT
+    products_text = ""
+    for idx, product in enumerate(products, 1):
+        name = product.get('name', 'N/A')
+        price = product.get('price', 'N/A')
+        description = product.get('description', 'N/A')
+        products_text += f"{idx}. {name}\n   Price: ${price}\n   Description: {description}\n\n"
+
+    prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community. A user has asked a question about products in a Group Buy form.
+
+Form: {form_title}
+
+Available Products:
+{products_text}
+
+User's Question: "{user_question}"
+
+Please provide a helpful, conversational answer to the user's question based on the products listed above.
+
+Guidelines:
+- Be friendly and conversational
+- Answer their specific question directly
+- If they ask about specific products, provide details about those products
+- If they ask general questions like "what's available", give an overview
+- If they ask about prices, include pricing information
+- If they ask about something not in the product list, politely let them know it's not available in this form
+- Keep your response concise but informative
+- Use a natural, helpful tone like you're talking to a friend"""
+
+    print(f"[DEBUG] generate_answer_with_products - Generating answer for: '{user_question}'")
+    print(f"[DEBUG] generate_answer_with_products - Using {len(products)} products")
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7
+    )
+
+    answer = response.choices[0].message.content.strip()
+    print(f"[DEBUG] generate_answer_with_products - Generated answer length: {len(answer)} chars")
+
+    return answer
+
 def analyze_message_for_gb(message_text, available_forms):
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
@@ -187,24 +237,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Get form title
                 form_title = available_forms.get(form_id, {}).get('title', 'Group Buy')
 
-                # Format the response
-                response = f"📋 *{form_title}*\n\n"
-                response += f"Found {len(products)} product(s):\n\n"
+                print(f"[DEBUG] handle_message - Generating conversational answer with ChatGPT")
 
-                for idx, product in enumerate(products, 1):
-                    name = product.get('name', 'N/A')
-                    price = product.get('price', 'N/A')
-                    description = product.get('description', 'N/A')
+                # Use ChatGPT to generate a natural answer to the user's question
+                answer = generate_answer_with_products(text, form_title, products)
 
-                    response += f"{idx}. *{name}*\n"
-                    response += f"   💰 Price: ${price}\n"
-
-                    # Truncate long descriptions
-                    if len(description) > 100:
-                        description = description[:100] + "..."
-                    response += f"   📝 {description}\n\n"
-
-                await update.message.reply_text(response, parse_mode='Markdown')
+                print(f"[DEBUG] handle_message - Sending answer to user")
+                await update.message.reply_text(answer)
             else:
                 await update.message.reply_text(
                     "I found the form, but couldn't retrieve any products. Please try again later."
