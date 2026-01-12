@@ -1630,7 +1630,31 @@ async def listallforms_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    text_lower = text.lower()
+    text_lower = text.lower().strip()
+
+    # Handle greetings and casual messages quickly (no API calls needed)
+    greetings = ['hello', 'hi', 'hey', 'howdy', 'hola', 'yo', 'sup', 'whats up', "what's up",
+                 'good morning', 'good afternoon', 'good evening', 'greetings']
+    thanks = ['thanks', 'thank you', 'thx', 'ty', 'appreciate it', 'appreciated']
+
+    # Check for simple greetings
+    if any(text_lower == g or text_lower.startswith(g + ' ') or text_lower.startswith(g + '!')
+           or text_lower.startswith(g + ',') for g in greetings):
+        await update.message.reply_text(
+            "Hello! I'm Bohemia's Steward. How can I help you today?\n\n"
+            "You can ask me about products, prices, or use /help to see available commands."
+        )
+        return
+
+    # Check for thanks
+    if any(t in text_lower for t in thanks):
+        await update.message.reply_text("You're welcome! Let me know if you need anything else.")
+        return
+
+    # Check for goodbye
+    if text_lower in ['bye', 'goodbye', 'see ya', 'later', 'cya']:
+        await update.message.reply_text("Goodbye! Feel free to reach out anytime.")
+        return
 
     # Check if this is a COA/test result question - redirect to admins
     if check_for_coa_test_question(text):
@@ -1658,8 +1682,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Try to identify which form the user is asking about using ChatGPT
     try:
-        await update.message.reply_text("🤔 Let me check that for you...")
-
         # Get all available forms
         available_forms = jotform_helper.get_all_forms()
         print(f"\n[DEBUG] handle_message - Retrieved {len(available_forms)} forms from JotFormHelper")
