@@ -611,6 +611,116 @@ GENERAL:
 
     return answer
 
+
+def generate_answer_with_multi_form_products(user_question, forms_data):
+    """
+    Uses ChatGPT to generate a natural conversational answer to the user's question
+    based on products from multiple forms. This handles cases where multiple forms
+    (e.g., two January GBs) need to be searched.
+
+    Args:
+        user_question: The user's question
+        forms_data: List of dicts, each containing:
+            - 'form_id': The form ID
+            - 'form_title': The form title
+            - 'products': List of products from this form
+            - 'vendor_info': Optional vendor metadata
+    """
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+    # Format products grouped by form
+    all_products_text = ""
+    form_titles = []
+
+    for form_info in forms_data:
+        form_title = form_info.get('form_title', 'Unknown Form')
+        products = form_info.get('products', [])
+        vendor_info = form_info.get('vendor_info', {})
+
+        form_titles.append(form_title)
+
+        if not products:
+            continue
+
+        all_products_text += f"\n=== {form_title} ===\n"
+
+        # Add vendor info if available
+        if vendor_info:
+            if vendor_info.get('vendor'):
+                all_products_text += f"Vendor: {vendor_info['vendor']}\n"
+            if vendor_info.get('deadline'):
+                all_products_text += f"Deadline: {vendor_info['deadline']}\n"
+
+        all_products_text += "\n"
+
+        for idx, product in enumerate(products, 1):
+            name = product.get('name', 'N/A')
+            price = product.get('price', 'N/A')
+            description = product.get('description', 'N/A')
+            all_products_text += f"{idx}. {name}\n   Price: ${price}\n   Description: {description}\n"
+
+            # Add MOQ and other fields if available
+            if 'moq' in product:
+                all_products_text += f"   MOQ (Minimum Order Quantity): {product['moq']}\n"
+            if 'quantity' in product:
+                all_products_text += f"   Quantity: {product['quantity']}\n"
+            if 'stock' in product:
+                all_products_text += f"   Stock: {product['stock']}\n"
+
+            all_products_text += "\n"
+
+    forms_list_text = ", ".join(form_titles)
+
+    prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community.
+
+IMPORTANT: The user's question may apply to MULTIPLE Group Buy forms. I've searched the following forms and found products in each:
+
+Forms searched: {forms_list_text}
+
+{all_products_text}
+
+User asked: "{user_question}"
+
+CRITICAL INSTRUCTIONS:
+- Search ALL forms listed above for relevant information
+- If the product exists in multiple forms, mention BOTH/ALL occurrences with their respective form names and details
+- Clearly indicate which form each piece of information comes from (e.g., "In the January GB #1, the MOQ is X. In January GB #2, the MOQ is Y.")
+- If the product only appears in one form, specify which form it's from
+- ONLY answer the specific question asked - don't volunteer extra information
+- Be conversational and natural - vary your tone and style
+- Match product abbreviations (Reta=Retatrutide, R30=products with 30, etc.)
+
+MOQ (Minimum Order Quantity) INSTRUCTIONS:
+- If user asks about MOQ, minimum order, or minimum quantity for a product:
+  1. Check ALL forms for that product
+  2. Report MOQ info from EACH form where the product appears
+  3. If MOQ differs between forms, clearly state both
+  4. If no MOQ info exists in any form, say: "I don't see a specific MOQ listed for [product] in any of the forms."
+
+GENERAL:
+- The Description field contains critical information including MOQ, lab details, testing info, and vendor specifics - ALWAYS read and use this information
+- Keep responses SHORT and direct
+- Always clarify which form information comes from"""
+
+    print(f"[DEBUG] generate_answer_with_multi_form_products - Generating answer for: '{user_question}'")
+    print(f"[DEBUG] generate_answer_with_multi_form_products - Using {len(forms_data)} forms")
+
+    response = call_openai_with_retry(
+        "generate_answer_with_multi_form_products",
+        lambda timeout: client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.95,
+            timeout=timeout
+        )
+    )
+
+    answer = response.choices[0].message.content.strip()
+    print(f"[DEBUG] generate_answer_with_multi_form_products - Generated answer length: {len(answer)} chars")
+
+    return answer
+
+
 def is_moq_question(message_text):
     """
     Detect if user is asking about MOQ/minimum order for a specific product.
@@ -727,10 +837,19 @@ def fuzzy_match_product_name(message_lower, product_name_lower):
 
     return score
 
-def find_form_by_product_names(message_text, available_forms):
+def find_form_by_product_names(message_text, available_forms, return_all_matches=False):
     """
     Search through products in all forms to find which form contains
     products mentioned in the user's message. Uses fuzzy matching for product names.
+
+    Args:
+        message_text: The user's message to search for product names
+        available_forms: Dictionary of available forms
+        return_all_matches: If True, returns all forms with matching products (not just the best)
+
+    Returns:
+        If return_all_matches=False: Single form_id string or None
+        If return_all_matches=True: List of form_ids with matches, sorted by score (best first)
     """
     print(f"[DEBUG] find_form_by_product_names - Searching for products in message: '{message_text}'")
 
@@ -775,19 +894,92 @@ def find_form_by_product_names(message_text, available_forms):
             print(f"[DEBUG] find_form_by_product_names - Error checking form {form_id}: {e}")
             continue
 
-    # Return the form with the highest score
-    if form_matches:
-        best_match = max(form_matches.items(), key=lambda x: x[1]['score'])
+    if not form_matches:
+        print(f"[DEBUG] find_form_by_product_names - No product matches found")
+        return [] if return_all_matches else None
+
+    # Sort matches by score (highest first)
+    sorted_matches = sorted(form_matches.items(), key=lambda x: x[1]['score'], reverse=True)
+
+    if return_all_matches:
+        # Return all forms that have matching products
+        form_ids = [form_id for form_id, _ in sorted_matches]
+        print(f"[DEBUG] find_form_by_product_names - Returning all {len(form_ids)} matching forms: {form_ids}")
+        return form_ids
+    else:
+        # Return just the best match (original behavior)
+        best_match = sorted_matches[0]
         form_id = best_match[0]
         match_info = best_match[1]
         print(f"[DEBUG] find_form_by_product_names - Best match: {form_id} ({match_info['title']}) with products: {match_info['products']}")
         return form_id
 
-    print(f"[DEBUG] find_form_by_product_names - No product matches found")
+def find_forms_by_month(month_name, available_forms):
+    """
+    Find all forms that match a specific month name.
+    Returns a list of form_ids that have the month in their title.
+    """
+    month_lower = month_name.lower()
+    matching_forms = []
+
+    for form_id, form_data in available_forms.items():
+        title = form_data.get('title', '').lower()
+        if month_lower in title:
+            matching_forms.append(form_id)
+
+    return matching_forms
+
+
+def detect_month_in_message(message_text):
+    """
+    Detect if the user's message mentions a specific month.
+    Returns the month name if found, None otherwise.
+    """
+    months = [
+        'january', 'february', 'march', 'april', 'may', 'june',
+        'july', 'august', 'september', 'october', 'november', 'december',
+        'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
+    ]
+
+    message_lower = message_text.lower()
+
+    for month in months:
+        # Check for month as a word boundary (not part of another word)
+        if re.search(rf'\b{month}\b', message_lower):
+            # Return the full month name
+            month_mapping = {
+                'jan': 'january', 'feb': 'february', 'mar': 'march',
+                'apr': 'april', 'jun': 'june', 'jul': 'july',
+                'aug': 'august', 'sep': 'september', 'oct': 'october',
+                'nov': 'november', 'dec': 'december'
+            }
+            return month_mapping.get(month, month)
+
     return None
 
+
 def analyze_message_for_gb(message_text, available_forms):
+    """
+    Analyze user message to determine which form(s) they're asking about.
+
+    Returns:
+        - A single form_id string if one form is clearly identified
+        - A list of form_ids if multiple forms match (e.g., two January GBs)
+        - None if no form could be identified
+    """
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+    # Check if user mentions a specific month
+    mentioned_month = detect_month_in_message(message_text)
+    if mentioned_month:
+        # Find all forms matching this month
+        matching_month_forms = find_forms_by_month(mentioned_month, available_forms)
+        print(f"[DEBUG] analyze_message_for_gb - User mentioned '{mentioned_month}', found {len(matching_month_forms)} matching forms")
+
+        if len(matching_month_forms) > 1:
+            # Multiple forms for this month - we'll need to check all of them
+            print(f"[DEBUG] analyze_message_for_gb - Multiple forms for {mentioned_month}: {matching_month_forms}")
+            return matching_month_forms
 
     # Sort forms by latest submission date to identify the most recent/current GB
     sorted_forms = sorted(
@@ -844,13 +1036,13 @@ Do not include any other text, explanation, or formatting."""
     elif result != "UNCLEAR":
         print(f"[DEBUG] ✗ Form ID '{result}' NOT found in available forms")
         print(f"[DEBUG] Available form IDs: {list(available_forms.keys())}")
-        # Try product-based search as fallback
-        print(f"[DEBUG] Trying product-based search as fallback...")
-        return find_form_by_product_names(message_text, available_forms)
+        # Try product-based search as fallback - return all matching forms
+        print(f"[DEBUG] Trying product-based search as fallback (returning all matches)...")
+        return find_form_by_product_names(message_text, available_forms, return_all_matches=True)
     else:
         print(f"[DEBUG] ChatGPT returned UNCLEAR, trying product-based search as fallback...")
-        # Try to find form by searching for product names in the message
-        return find_form_by_product_names(message_text, available_forms)
+        # Try to find form by searching for product names in the message - return all matching forms
+        return find_form_by_product_names(message_text, available_forms, return_all_matches=True)
 
 # Initialize global JotFormHelper instance
 jotform_helper = JotFormHelper()
@@ -1813,11 +2005,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"\n[DEBUG] handle_message - Retrieved {len(available_forms)} forms from JotFormHelper")
         print(f"[DEBUG] handle_message - Form IDs: {list(available_forms.keys())}")
 
-        # Use ChatGPT to analyze the message and identify the form
-        form_id = analyze_message_for_gb(text, available_forms)
-        print(f"[DEBUG] handle_message - analyze_message_for_gb returned: {form_id}")
+        # Use ChatGPT to analyze the message and identify the form(s)
+        form_result = analyze_message_for_gb(text, available_forms)
+        print(f"[DEBUG] handle_message - analyze_message_for_gb returned: {form_result}")
 
-        if form_id:
+        # Check if we got multiple forms (list) or a single form (string)
+        if isinstance(form_result, list) and len(form_result) > 1:
+            # Multiple forms match - fetch products from all of them
+            print(f"[DEBUG] handle_message - Multiple forms detected: {form_result}")
+
+            forms_data = []
+            for fid in form_result:
+                print(f"[DEBUG] handle_message - Fetching products for form_id: {fid}")
+                products = jotform_helper.get_products(fid)
+
+                if products:
+                    form_title = available_forms.get(fid, {}).get('title', 'Group Buy')
+                    vendor_info = jotform_helper.get_form_metadata(fid)
+
+                    forms_data.append({
+                        'form_id': fid,
+                        'form_title': form_title,
+                        'products': products,
+                        'vendor_info': vendor_info
+                    })
+                    print(f"[DEBUG] handle_message - Form {fid} ({form_title}): {len(products)} products")
+
+            if forms_data:
+                print(f"[DEBUG] handle_message - Generating multi-form answer with {len(forms_data)} forms")
+                answer = generate_answer_with_multi_form_products(text, forms_data)
+                await update.message.reply_text(answer)
+            else:
+                await update.message.reply_text(
+                    "I found multiple forms that might match, but couldn't retrieve products from any of them. "
+                    "Please try again later."
+                )
+
+        elif form_result:
+            # Single form identified (either string or single-item list)
+            form_id = form_result[0] if isinstance(form_result, list) else form_result
+
             # Get products for the identified form
             print(f"[DEBUG] handle_message - Fetching products for form_id: {form_id}")
             products = jotform_helper.get_products(form_id)
@@ -1842,8 +2069,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "I found the form, but couldn't retrieve any products. Please try again later."
                 )
         else:
-            # List available forms to help the user
-            forms_names = [f"• {form_data['title']}" for form_id, form_data in available_forms.items()]
+            # No form identified - list available forms to help the user
+            forms_names = [f"• {form_data['title']}" for fid, form_data in available_forms.items()]
             forms_text = "\n".join(forms_names[:5])  # Show up to 5 forms
 
             await update.message.reply_text(
