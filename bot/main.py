@@ -1045,7 +1045,11 @@ async def setdeadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Admin command to set the deadline for the current GB."""
     user = update.effective_user
 
-    if not context.args:
+    # Get full message text to preserve formatting
+    raw_text = update.message.text
+    command_end = raw_text.find(' ')
+
+    if command_end == -1 or not raw_text[command_end:].strip():
         await update.message.reply_text(
             "Usage: /setdeadline <deadline text>\n\n"
             "Examples:\n"
@@ -1055,7 +1059,7 @@ async def setdeadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    deadline_text = " ".join(context.args)
+    deadline_text = raw_text[command_end + 1:]
 
     await set_deadline(
         deadline_text,
@@ -1132,7 +1136,11 @@ async def setvendors_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Admin command to set the vendors for the current GB."""
     user = update.effective_user
 
-    if not context.args:
+    # Get full message text to preserve formatting
+    raw_text = update.message.text
+    command_end = raw_text.find(' ')
+
+    if command_end == -1 or not raw_text[command_end:].strip():
         await update.message.reply_text(
             "Usage: /setvendors <vendor names>\n\n"
             "Examples:\n"
@@ -1142,7 +1150,7 @@ async def setvendors_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    vendors_text = " ".join(context.args)
+    vendors_text = raw_text[command_end + 1:]
 
     await set_vendors(
         vendors_text,
@@ -1208,18 +1216,24 @@ async def setstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command to set the status for the current GB."""
     user = update.effective_user
 
-    if not context.args:
+    # Get full message text to preserve formatting (newlines, emojis, etc.)
+    raw_text = update.message.text
+    # Remove the command part, keeping everything after "/setstatus "
+    command_end = raw_text.find(' ')
+
+    if command_end == -1 or not raw_text[command_end:].strip():
         await update.message.reply_text(
             "Usage: /setstatus <status text>\n\n"
             "Examples:\n"
             "/setstatus Orders open - deadline Jan 15\n"
             "/setstatus Waiting on shipment from vendor\n"
             "/setstatus Packages shipped - tracking sent via DM\n"
-            "/setstatus GB closed - processing orders"
+            "/setstatus GB closed - processing orders\n\n"
+            "Tip: You can use multiple lines and emojis!"
         )
         return
 
-    status_text = " ".join(context.args)
+    status_text = raw_text[command_end + 1:]
 
     await set_status(
         status_text,
