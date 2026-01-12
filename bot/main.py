@@ -24,6 +24,41 @@ load_dotenv()
 
 # Cache TTL configuration (default: 5 minutes)
 CACHE_TTL_SECONDS = int(os.getenv('CACHE_TTL_SECONDS', 300))
+OPENAI_TIMEOUT_SECONDS = int(os.getenv('OPENAI_TIMEOUT_SECONDS', 30))
+OPENAI_MAX_RETRIES = int(os.getenv('OPENAI_MAX_RETRIES', 3))
+OPENAI_BACKOFF_SECONDS = float(os.getenv('OPENAI_BACKOFF_SECONDS', 1))
+
+
+class ExternalServiceError(Exception):
+    """Raised when an external service call fails after retries."""
+
+
+def log_error(context, error, extra=None):
+    print(f"[ERROR] {context} - {error}")
+    if extra:
+        for key, value in extra.items():
+            print(f"[ERROR] {context} - {key}: {value}")
+
+
+def call_openai_with_retry(operation_name, call_fn, max_retries=OPENAI_MAX_RETRIES,
+                           backoff_seconds=OPENAI_BACKOFF_SECONDS,
+                           timeout_seconds=OPENAI_TIMEOUT_SECONDS):
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return call_fn(timeout=timeout_seconds)
+        except Exception as e:
+            last_error = e
+            log_error(f"{operation_name} attempt {attempt}/{max_retries}", e)
+            if attempt >= max_retries:
+                raise ExternalServiceError(
+                    f"{operation_name} failed after {max_retries} attempts"
+                ) from e
+            sleep_seconds = backoff_seconds * (2 ** (attempt - 1))
+            print(f"[DEBUG] {operation_name} - retrying in {sleep_seconds:.1f}s")
+            time.sleep(sleep_seconds)
+
+    raise ExternalServiceError(f"{operation_name} failed after retries") from last_error
 
 # =============================================================================
 # STATIC FAQ SYSTEM
@@ -140,6 +175,28 @@ class JotFormHelper:
         self.forms_cache_timestamp = 0
         self.products_cache_timestamps = {}  # per-form timestamps
         self.form_metadata_cache_timestamps = {}  # per-form timestamps
+        self.max_retries = int(os.getenv('JOTFORM_MAX_RETRIES', 3))
+        self.backoff_seconds = float(os.getenv('JOTFORM_BACKOFF_SECONDS', 1))
+
+    def _call_with_retry(self, operation_name, call_fn):
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                return call_fn()
+            except Exception as e:
+                last_error = e
+                log_error(f"JotFormHelper.{operation_name} attempt {attempt}/{self.max_retries}", e)
+                if attempt >= self.max_retries:
+                    raise ExternalServiceError(
+                        f"JotFormHelper.{operation_name} failed after {self.max_retries} attempts"
+                    ) from e
+                sleep_seconds = self.backoff_seconds * (2 ** (attempt - 1))
+                print(f"[DEBUG] JotFormHelper.{operation_name} - retrying in {sleep_seconds:.1f}s")
+                time.sleep(sleep_seconds)
+
+        raise ExternalServiceError(
+            f"JotFormHelper.{operation_name} failed after retries"
+        ) from last_error
 
     def is_cache_expired(self, timestamp):
         """Check if a cache entry has expired based on TTL."""
@@ -171,7 +228,7 @@ class JotFormHelper:
         # Cache expired or empty - fetch fresh data
         print(f"[DEBUG] JotFormHelper.get_all_forms - Fetching forms from JotForm API (cache expired or forced refresh)")
         try:
-            forms = self.client.get_forms()
+            forms = self._call_with_retry("get_forms", self.client.get_forms)
             print(f"[DEBUG] JotFormHelper.get_all_forms - Retrieved {len(forms)} forms from API")
 
             # Clear old cache
@@ -181,12 +238,25 @@ class JotFormHelper:
                 # Get latest submission date for each form
                 latest_submission = None
                 try:
-                    submissions = self.client.get_form_submissions(form['id'], limit=1, orderby='created_at')
+                    submissions = self._call_with_retry(
+                        f"get_form_submissions:{form['id']}",
+                        lambda: self.client.get_form_submissions(form['id'], limit=1, orderby='created_at')
+                    )
                     if submissions and len(submissions) > 0:
                         latest_submission = submissions[0].get('created_at', '')
                         print(f"[DEBUG] JotFormHelper.get_all_forms - Form {form['id']} latest submission: {latest_submission}")
+                except ExternalServiceError as e:
+                    log_error(
+                        "JotFormHelper.get_all_forms - Failed to fetch submissions",
+                        e,
+                        {"form_id": form.get('id')}
+                    )
                 except Exception as e:
-                    print(f"[DEBUG] JotFormHelper.get_all_forms - Could not fetch submissions for {form['id']}: {e}")
+                    log_error(
+                        "JotFormHelper.get_all_forms - Could not fetch submissions",
+                        e,
+                        {"form_id": form.get('id')}
+                    )
 
                 self.forms_cache[form['id']] = {
                     'id': form['id'],
@@ -200,9 +270,15 @@ class JotFormHelper:
             self.forms_cache_timestamp = time.time()
             print(f"[DEBUG] JotFormHelper.get_all_forms - Cache refreshed at {self.forms_cache_timestamp}")
 
-        except Exception as e:
-            print(f"[ERROR] JotFormHelper.get_all_forms - Error fetching forms: {e}")
+        except ExternalServiceError as e:
+            log_error("JotFormHelper.get_all_forms - Error fetching forms", e)
             # If we have stale cache data, return it rather than nothing
+            if self.forms_cache:
+                print(f"[DEBUG] JotFormHelper.get_all_forms - Returning stale cache due to error")
+                return self.forms_cache
+            raise
+        except Exception as e:
+            log_error("JotFormHelper.get_all_forms - Error fetching forms", e)
             if self.forms_cache:
                 print(f"[DEBUG] JotFormHelper.get_all_forms - Returning stale cache due to error")
                 return self.forms_cache
@@ -324,7 +400,10 @@ class JotFormHelper:
 
         try:
             print(f"[DEBUG] JotFormHelper.get_products - Fetching properties for form {form_id} (cache expired or forced refresh)")
-            properties = self.client.get_form_properties(form_id)
+            properties = self._call_with_retry(
+                f"get_form_properties:{form_id}",
+                lambda: self.client.get_form_properties(form_id)
+            )
             raw_products = properties.get('products', [])
             print(f"[DEBUG] JotFormHelper.get_products - Raw products count: {len(raw_products)}")
             clean_products = self.clean_products(raw_products)
@@ -336,11 +415,19 @@ class JotFormHelper:
             print(f"[DEBUG] JotFormHelper.get_products - Cache refreshed for form {form_id}")
 
             return clean_products
-        except Exception as e:
-            print(f"[ERROR] JotFormHelper.get_products - Error fetching products: {e}")
+        except ExternalServiceError as e:
+            log_error("JotFormHelper.get_products - Error fetching products", e, {"form_id": form_id})
             import traceback
             traceback.print_exc()
             # Return stale cache if available
+            if form_id in self.products_cache:
+                print(f"[DEBUG] JotFormHelper.get_products - Returning stale cache due to error")
+                return self.products_cache[form_id]
+            raise
+        except Exception as e:
+            log_error("JotFormHelper.get_products - Error fetching products", e, {"form_id": form_id})
+            import traceback
+            traceback.print_exc()
             if form_id in self.products_cache:
                 print(f"[DEBUG] JotFormHelper.get_products - Returning stale cache due to error")
                 return self.products_cache[form_id]
@@ -442,10 +529,14 @@ CRITICAL INSTRUCTIONS:
     print(f"[DEBUG] generate_answer_with_products - Generating answer for: '{user_question}'")
     print(f"[DEBUG] generate_answer_with_products - Using {len(products)} products")
 
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.95
+    response = call_openai_with_retry(
+        "generate_answer_with_products",
+        lambda timeout: client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.95,
+            timeout=timeout
+        )
     )
 
     answer = response.choices[0].message.content.strip()
@@ -641,10 +732,14 @@ Do not include any other text, explanation, or formatting."""
     print(f"[DEBUG] Available forms: {len(available_forms)}")
     print(f"[DEBUG] Forms list sent to ChatGPT:\n{forms_list}\n")
 
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
+    response = call_openai_with_retry(
+        "analyze_message_for_gb",
+        lambda timeout: client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            timeout=timeout
+        )
     )
 
     result = response.choices[0].message.content.strip()
@@ -1608,11 +1703,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Available forms:\n{forms_text}\n\n"
                 f"Try mentioning a month (e.g., 'January GB') or ask about the 'current' or 'latest' GB."
             )
+    except ExternalServiceError as e:
+        log_error("handle_message - External service failure", e, {"user_message": text})
+        await update.message.reply_text(
+            "I'm having trouble reaching the data source—please try again."
+        )
     except Exception as e:
-        print(f"Error in handle_message: {e}")
+        log_error("handle_message - Unexpected error", e, {"user_message": text})
         await update.message.reply_text(
             "Sorry, I encountered an error processing your request. Please try again later."
         )
+
 async def post_init(application):
     """Initialize database and other startup tasks."""
     print("[STARTUP] Initializing database...")
