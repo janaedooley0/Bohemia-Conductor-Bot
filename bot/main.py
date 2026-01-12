@@ -469,6 +469,10 @@ FAQ_DATABASE = {
     },
 
     # Timing
+    "current gb": {
+        "keywords": ["current gb info", "current group buy info", "what gb is active", "gb info", "current gb details"],
+        "answer": "Use /currentgb to see information about the current Group Buy including vendor, deadline, and product count. Use /products to see the full product list, or just ask me about specific products!"
+    },
     "when next gb": {
         "keywords": ["next gb", "next group buy", "upcoming gb", "future gb", "when is next", "new gb"],
         "answer": "New Group Buys are announced in the Telegram group. Keep an eye on announcements and pinned messages for upcoming GBs. You can also ask about the 'current GB' to see what's available now."
@@ -1372,6 +1376,11 @@ async def generate_answer_with_context_async(user_question, form_title, products
     if vendor_info and vendor_info.get('deadline'):
         deadline_text = f"\nDeadline/Closing Date: {vendor_info['deadline']}"
 
+    # Add status information if available
+    status_text = ""
+    if vendor_info and vendor_info.get('status'):
+        status_text = f"\nCurrent Status: {vendor_info['status']}"
+
     # Build conversation context section
     context_text = ""
     if conversation_context:
@@ -1390,7 +1399,7 @@ async def generate_answer_with_context_async(user_question, form_title, products
 
     prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community.
 
-Form: {form_title}{vendor_text}{deadline_text}
+Form: {form_title}{vendor_text}{deadline_text}{status_text}
 
 Products:
 {products_text}
@@ -1417,6 +1426,16 @@ MOQ (Minimum Order Quantity) INSTRUCTIONS:
   2. If not, search the Description field for MOQ info
   3. If MOQ is found, state it clearly: "The MOQ for [product] is [amount]"
   4. If no MOQ info exists, say: "I don't see a specific MOQ listed for [product]. Some products have no minimum - check the order form or ask an admin."
+
+CURRENT GB QUESTIONS:
+- If user asks about the "current GB", "active GB", or "latest GB", provide:
+  1. The form name (from the Form header)
+  2. Vendor/Supplier info (if available)
+  3. Deadline (if available)
+  4. Current Status (if available)
+  5. Briefly mention how many products are available
+- If they ask "what products are in the current GB", list the key products (first 5-10)
+- If they ask about a specific aspect (vendor, deadline, products, status), focus on that
 
 GENERAL:
 - The Description field contains critical information including MOQ, lab details, testing info, and vendor specifics - ALWAYS read and use this information
@@ -1468,6 +1487,8 @@ async def generate_answer_with_multi_form_context_async(user_question, forms_dat
                 all_products_text += f"Vendor: {vendor_info['vendor']}\n"
             if vendor_info.get('deadline'):
                 all_products_text += f"Deadline: {vendor_info['deadline']}\n"
+            if vendor_info.get('status'):
+                all_products_text += f"Status: {vendor_info['status']}\n"
 
         all_products_text += "\n"
 
@@ -1822,6 +1843,33 @@ def analyze_message_for_gb(message_text, available_forms):
         - None if no form could be identified
     """
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+    message_lower = message_text.lower()
+
+    # PRIORITY 0: Check if user is explicitly asking about "current/active/latest" GB
+    # This provides a fast path without needing ChatGPT
+    current_gb_keywords = [
+        'current gb', 'current g&b', 'current group buy',
+        'active gb', 'active g&b', 'active group buy',
+        'latest gb', 'latest g&b', 'latest group buy',
+        'newest gb', 'newest g&b', 'newest group buy',
+        'most recent gb', 'most recent g&b', 'most recent group buy',
+        "what's the current", "what is the current",
+        "what's the active", "what is the active",
+        "what's the latest", "what is the latest",
+        'what gb is', 'which gb is'
+    ]
+
+    if any(keyword in message_lower for keyword in current_gb_keywords):
+        # User is asking about the current GB - return the most recent form directly
+        sorted_forms = sorted(
+            available_forms.items(),
+            key=lambda x: x[1].get('latest_submission', x[1].get('created', '')),
+            reverse=True
+        )
+        if sorted_forms:
+            current_form_id = sorted_forms[0][0]
+            print(f"[DEBUG] analyze_message_for_gb - Current GB question detected, returning most recent form: {current_form_id}")
+            return current_form_id
 
     # PRIORITY 1: If this looks like a product query (not form-specific),
     # search for the product across all forms FIRST
@@ -2066,6 +2114,48 @@ async def get_current_gb_form_id():
         return form_id, False
 
     return None, False
+
+
+async def get_vendor_info_with_overrides(form_id):
+    """
+    Get vendor info for a form, merging database overrides with JotForm metadata.
+
+    Database overrides (set via /setvendors, /setdeadline, /setstatus) take priority
+    for the current GB form. For other forms, falls back to JotForm metadata.
+
+    Returns a dict with: vendor, suppliers, deadline, status
+    """
+    # Get JotForm metadata as the base
+    vendor_info = jotform_helper.get_form_metadata(form_id) or {}
+
+    # Check if this form is the current GB
+    current_gb_id, _ = await get_current_gb_form_id()
+
+    if current_gb_id and str(form_id) == str(current_gb_id):
+        # This is the current GB - apply database overrides
+        print(f"[DEBUG] get_vendor_info_with_overrides - Form {form_id} is current GB, checking for overrides")
+
+        # Get database overrides
+        db_deadline = await get_deadline()
+        db_vendors = await get_vendors()
+        db_status = await get_status()
+
+        # Override with database values if set
+        if db_deadline:
+            vendor_info['deadline'] = db_deadline
+            print(f"[DEBUG] get_vendor_info_with_overrides - Using database deadline: {db_deadline}")
+
+        if db_vendors:
+            vendor_info['vendor'] = db_vendors
+            # Also update suppliers list
+            vendor_info['suppliers'] = [v.strip() for v in db_vendors.split(',')]
+            print(f"[DEBUG] get_vendor_info_with_overrides - Using database vendors: {db_vendors}")
+
+        if db_status:
+            vendor_info['status'] = db_status
+            print(f"[DEBUG] get_vendor_info_with_overrides - Using database status: {db_status}")
+
+    return vendor_info
 
 
 # =============================================================================
@@ -2530,6 +2620,39 @@ async def jotform_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ORDER STATUS LOOKUP COMMAND (Interactive Conversation Handler)
 # =============================================================================
 
+def is_order_form(form_title):
+    """
+    Check if a form is an order form (not an interest form or survey).
+    Returns True for order forms, False for interest forms and surveys.
+    """
+    title_lower = form_title.lower()
+
+    # Patterns that indicate this is NOT an order form
+    exclude_patterns = [
+        'interest',
+        'survey',
+        'poll',
+        'feedback',
+        'contact',
+        'inquiry',
+        'question',
+        'signup',
+        'sign up',
+        'sign-up',
+        'registration',
+        'waitlist',
+        'wait list',
+        'notify',
+        'notification'
+    ]
+
+    for pattern in exclude_patterns:
+        if pattern in title_lower:
+            return False
+
+    return True
+
+
 async def getorderstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the order status lookup flow with form selection."""
     try:
@@ -2537,10 +2660,14 @@ async def getorderstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         forms_list = await get_forms_list()
 
         if not forms_list:
-            # Fallback to all forms if no curated list
+            # Fallback to all forms if no curated list, but filter out interest forms
             all_forms = jotform_helper.get_all_forms()
-            forms_list = [{'form_id': fid, 'form_title': fdata.get('title', 'Unknown')}
-                          for fid, fdata in all_forms.items()]
+            forms_list = [
+                {'form_id': fid, 'form_title': fdata.get('title', 'Unknown')}
+                for fid, fdata in all_forms.items()
+                if is_order_form(fdata.get('title', ''))
+            ]
+            print(f"[DEBUG] getorderstatus_command - Filtered to {len(forms_list)} order forms (excluded interest forms)")
 
         if not forms_list:
             await update.message.reply_text(
@@ -3780,7 +3907,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if products:
                     form_title = available_forms.get(fid, {}).get('title', 'Group Buy')
-                    vendor_info = jotform_helper.get_form_metadata(fid)
+                    vendor_info = await get_vendor_info_with_overrides(fid)
 
                     forms_data.append({
                         'form_id': fid,
@@ -3833,11 +3960,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"[DEBUG] handle_message - Retrieved {len(products) if products else 0} products")
 
             if products:
-                # Get form title and metadata (including vendor info)
+                # Get form title and metadata (including vendor info with database overrides)
                 form_title = available_forms.get(form_id, {}).get('title', 'Group Buy')
 
-                print(f"[DEBUG] handle_message - Fetching form metadata for vendor info")
-                vendor_info = jotform_helper.get_form_metadata(form_id)
+                print(f"[DEBUG] handle_message - Fetching form metadata with database overrides")
+                vendor_info = await get_vendor_info_with_overrides(form_id)
 
                 print(f"[DEBUG] handle_message - Generating conversational answer with ChatGPT (context-aware)")
 
@@ -3902,7 +4029,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 products = conv_context.get('cached_products', [])
 
                 if products:
-                    vendor_info = jotform_helper.get_form_metadata(form_id)
+                    vendor_info = await get_vendor_info_with_overrides(form_id)
                     answer = await generate_answer_with_context_async(
                         text,
                         form_title,
