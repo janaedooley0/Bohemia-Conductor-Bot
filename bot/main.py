@@ -2275,10 +2275,13 @@ def format_order_display(order_data):
     Returns:
         Formatted string for Telegram message
     """
-    form_title = order_data.get('form_title', 'Group Buy')
-    telegram_username = order_data.get('telegram_username', 'N/A')
-    customer_name = order_data.get('customer_name', '')
-    invoice_id = order_data.get('invoice_id', 'N/A')
+    import html
+
+    # Escape HTML in all user-provided data to prevent parse errors
+    form_title = html.escape(str(order_data.get('form_title', 'Group Buy')))
+    telegram_username = html.escape(str(order_data.get('telegram_username', 'N/A')))
+    customer_name = html.escape(str(order_data.get('customer_name', '')))
+    invoice_id = html.escape(str(order_data.get('invoice_id', 'N/A')))
     products = order_data.get('products', [])
 
     # Build the display string
@@ -2302,9 +2305,9 @@ def format_order_display(order_data):
     if products:
         lines.append("<b>Order Items:</b>")
         for i, product in enumerate(products, 1):
-            name = product.get('name', 'Unknown Item')
-            quantity = product.get('quantity', '')
-            price = product.get('price', '')
+            name = html.escape(str(product.get('name', 'Unknown Item')))
+            quantity = html.escape(str(product.get('quantity', '')))
+            price = html.escape(str(product.get('price', '')))
 
             if quantity and price:
                 lines.append(f"  {i}. {name} (x{quantity}) - ${price}")
