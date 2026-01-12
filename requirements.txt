@@ -9,4 +9,4 @@ jotform==0.1.1
 openai>=1.0.0
 python-dateutil>=2.8.0
 python-dotenv==1.2.1
-python-telegram-bot==22.5
+python-telegram-bot[job-queue]==22.5
