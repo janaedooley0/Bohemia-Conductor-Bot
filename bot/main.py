@@ -58,6 +58,155 @@ EVENT_ERROR = 'error'
 EVENT_GREETING = 'greeting'
 EVENT_REMINDER_SENT = 'reminder_sent'
 
+# =============================================================================
+# CONVERSATION CONTEXT MANAGEMENT
+# =============================================================================
+# Keys for storing conversation context (prevents clearing unrelated data)
+CONTEXT_KEY_CONVERSATION = 'conversation_context'
+CONTEXT_KEY_REPORT = 'report_data'
+CONTEXT_KEY_STATUS = 'status_data'
+
+# How long to remember conversation context (in seconds)
+CONVERSATION_CONTEXT_TTL = int(os.getenv('CONVERSATION_CONTEXT_TTL', 600))  # 10 minutes default
+
+
+def get_conversation_context(context):
+    """
+    Get the current conversation context for a user.
+    Returns a dict with keys like: form_id, form_title, products_discussed, last_product, last_topic, timestamp
+    """
+    ctx = context.user_data.get(CONTEXT_KEY_CONVERSATION, {})
+
+    # Check if context has expired
+    if ctx and 'timestamp' in ctx:
+        age = time.time() - ctx['timestamp']
+        if age > CONVERSATION_CONTEXT_TTL:
+            print(f"[DEBUG] get_conversation_context - Context expired (age: {age:.0f}s)")
+            context.user_data[CONTEXT_KEY_CONVERSATION] = {}
+            return {}
+
+    return ctx
+
+
+def update_conversation_context(context, **kwargs):
+    """
+    Update the conversation context with new information.
+    Always updates the timestamp to keep the context fresh.
+
+    Common keys:
+    - form_id: The JotForm form ID being discussed
+    - form_title: The form title (for display)
+    - products_discussed: List of product names mentioned
+    - last_product: The most recently discussed product
+    - last_topic: What the user was asking about (price, moq, availability, etc.)
+    - last_message: The user's last message (for reference)
+    - last_response: Brief summary of bot's last response
+    """
+    ctx = context.user_data.get(CONTEXT_KEY_CONVERSATION, {})
+    ctx.update(kwargs)
+    ctx['timestamp'] = time.time()
+    context.user_data[CONTEXT_KEY_CONVERSATION] = ctx
+    print(f"[DEBUG] update_conversation_context - Updated: {list(kwargs.keys())}")
+    return ctx
+
+
+def clear_conversation_context(context):
+    """Clear only the conversation context, preserving other user data."""
+    context.user_data.pop(CONTEXT_KEY_CONVERSATION, None)
+    print(f"[DEBUG] clear_conversation_context - Cleared")
+
+
+def extract_topic_from_message(message_text):
+    """
+    Extract what topic/aspect the user is asking about from their message.
+    Returns a string like 'price', 'moq', 'availability', 'description', etc.
+    """
+    message_lower = message_text.lower()
+
+    if any(kw in message_lower for kw in ['price', 'cost', 'how much', '$', 'dollar']):
+        return 'price'
+    elif any(kw in message_lower for kw in ['moq', 'minimum order', 'minimum quantity', 'min order', 'at least']):
+        return 'moq'
+    elif any(kw in message_lower for kw in ['available', 'availability', 'in stock', 'stock', 'left']):
+        return 'availability'
+    elif any(kw in message_lower for kw in ['description', 'describe', 'what is', "what's", 'about']):
+        return 'description'
+    elif any(kw in message_lower for kw in ['vendor', 'supplier', 'source', 'from']):
+        return 'vendor'
+    elif any(kw in message_lower for kw in ['deadline', 'when', 'close', 'closes', 'end']):
+        return 'deadline'
+    elif any(kw in message_lower for kw in ['ship', 'shipping', 'delivery', 'arrive']):
+        return 'shipping'
+    else:
+        return 'general'
+
+
+def is_followup_question(message_text):
+    """
+    Detect if this message is likely a follow-up question that relies on context.
+    """
+    message_lower = message_text.lower().strip()
+
+    # Short questions that typically need context
+    followup_patterns = [
+        # Pronoun references
+        'what about', 'how about', 'and the', 'and that', 'and this',
+        'what is it', "what's it", 'how much is it', 'is it', 'does it',
+        'what about that', 'what about this', 'that one', 'this one',
+        # Comparative/additional questions
+        'what else', 'anything else', 'other options', 'alternatives',
+        'same for', 'similar', 'compare', 'vs', 'versus',
+        # Short attribute questions
+        'price?', 'moq?', 'cost?', 'available?', 'in stock?',
+        'how much?', 'minimum?', 'description?',
+        # Pronouns at start
+    ]
+
+    # Check for follow-up patterns
+    if any(pattern in message_lower for pattern in followup_patterns):
+        return True
+
+    # Very short messages (under 30 chars) asking about attributes are likely follow-ups
+    if len(message_lower) < 30:
+        # Questions like "price?" "moq?" "how much?"
+        if message_lower.endswith('?') and any(kw in message_lower for kw in
+            ['price', 'moq', 'cost', 'stock', 'available', 'minimum', 'much']):
+            return True
+
+    # Messages starting with "and" or "also"
+    if message_lower.startswith(('and ', 'also ', 'plus ', 'or ')):
+        return True
+
+    return False
+
+
+def find_product_in_context_products(message_text, products_list):
+    """
+    Try to find which product from a list the user is asking about.
+    Returns the product dict if found, None otherwise.
+    """
+    if not products_list:
+        return None
+
+    message_lower = message_text.lower()
+
+    # Check each product for a match
+    for product in products_list:
+        product_name = product.get('name', '').lower()
+        if not product_name:
+            continue
+
+        # Direct match
+        if product_name in message_lower:
+            return product
+
+        # Check first word (often the drug name)
+        first_word = product_name.split()[0] if product_name else ''
+        if len(first_word) >= 3 and first_word in message_lower:
+            return product
+
+    return None
+
 
 class ExternalServiceError(Exception):
     """Raised when an external service call fails after retries."""
@@ -204,9 +353,40 @@ def extract_moq_from_description(description):
     return None
 
 
+async def call_openai_with_retry_async(operation_name, call_fn, max_retries=OPENAI_MAX_RETRIES,
+                                        backoff_seconds=OPENAI_BACKOFF_SECONDS,
+                                        timeout_seconds=OPENAI_TIMEOUT_SECONDS):
+    """
+    Async version of OpenAI retry logic that doesn't block the event loop.
+    Uses asyncio.sleep() for backoff instead of time.sleep().
+    """
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Run the sync OpenAI call in a thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: call_fn(timeout=timeout_seconds))
+            return result
+        except Exception as e:
+            last_error = e
+            log_error(f"{operation_name} attempt {attempt}/{max_retries}", e)
+            if attempt >= max_retries:
+                raise ExternalServiceError(
+                    f"{operation_name} failed after {max_retries} attempts"
+                ) from e
+            sleep_seconds = backoff_seconds * (2 ** (attempt - 1))
+            print(f"[DEBUG] {operation_name} - retrying in {sleep_seconds:.1f}s")
+            await asyncio.sleep(sleep_seconds)
+
+    raise ExternalServiceError(f"{operation_name} failed after retries") from last_error
+
+
 def call_openai_with_retry(operation_name, call_fn, max_retries=OPENAI_MAX_RETRIES,
                            backoff_seconds=OPENAI_BACKOFF_SECONDS,
                            timeout_seconds=OPENAI_TIMEOUT_SECONDS):
+    """
+    Sync version for backward compatibility. Prefer call_openai_with_retry_async in async contexts.
+    """
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -1144,6 +1324,230 @@ GENERAL:
 
     answer = response.choices[0].message.content.strip()
     print(f"[DEBUG] generate_answer_with_multi_form_products - Generated answer length: {len(answer)} chars")
+
+    return answer
+
+
+async def generate_answer_with_context_async(user_question, form_title, products, vendor_info=None, conversation_context=None):
+    """
+    Async version that generates a natural conversational answer using conversation context.
+    This enables proper multi-turn conversations by providing context about what was discussed before.
+
+    Args:
+        user_question: The user's current question
+        form_title: The form title
+        products: List of products from the form
+        vendor_info: Optional vendor metadata
+        conversation_context: Dict with previous conversation context (last_product, last_topic, etc.)
+    """
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+    # Format products as a clean list for ChatGPT
+    products_text = ""
+    for idx, product in enumerate(products, 1):
+        name = product.get('name', 'N/A')
+        price = product.get('price', 'N/A')
+        description = product.get('description', 'N/A')
+        products_text += f"{idx}. {name}\n   Price: ${price}\n   Description: {description}\n"
+
+        if 'moq' in product:
+            products_text += f"   MOQ (Minimum Order Quantity): {product['moq']}\n"
+        if 'quantity' in product:
+            products_text += f"   Quantity: {product['quantity']}\n"
+        if 'stock' in product:
+            products_text += f"   Stock: {product['stock']}\n"
+        products_text += "\n"
+
+    # Add vendor information if available
+    vendor_text = ""
+    if vendor_info:
+        if vendor_info.get('vendor'):
+            vendor_text += f"\nVendor/Supplier: {vendor_info['vendor']}"
+        elif vendor_info.get('suppliers'):
+            vendors_list = ', '.join(vendor_info['suppliers'])
+            vendor_text += f"\nVendors/Suppliers: {vendors_list}"
+
+    # Add deadline information if available
+    deadline_text = ""
+    if vendor_info and vendor_info.get('deadline'):
+        deadline_text = f"\nDeadline/Closing Date: {vendor_info['deadline']}"
+
+    # Build conversation context section
+    context_text = ""
+    if conversation_context:
+        context_parts = []
+        if conversation_context.get('last_product'):
+            context_parts.append(f"- User was previously asking about: {conversation_context['last_product']}")
+        if conversation_context.get('last_topic'):
+            context_parts.append(f"- Previous topic of discussion: {conversation_context['last_topic']}")
+        if conversation_context.get('last_message'):
+            context_parts.append(f"- User's previous message: \"{conversation_context['last_message'][:100]}\"")
+        if conversation_context.get('products_discussed'):
+            context_parts.append(f"- Products mentioned in conversation: {', '.join(conversation_context['products_discussed'][:5])}")
+
+        if context_parts:
+            context_text = "\n\nCONVERSATION CONTEXT (use this to understand follow-up questions):\n" + "\n".join(context_parts)
+
+    prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community.
+
+Form: {form_title}{vendor_text}{deadline_text}
+
+Products:
+{products_text}
+{context_text}
+
+User asked: "{user_question}"
+
+CRITICAL INSTRUCTIONS:
+- ONLY answer the specific question asked - don't volunteer extra information
+- If they ask a vague question like "What about X GB?", ask what specifically they want to know
+- Be conversational and natural - vary your tone and style
+- Match product abbreviations (Reta=Retatrutide, R30=products with 30, etc.)
+- For ambiguous product names, ask for clarification
+
+FOLLOW-UP QUESTION HANDLING:
+- If the user asks a short/vague follow-up like "what about the price?" or "moq?" or "how much?", USE THE CONVERSATION CONTEXT to understand what they're asking about
+- If they say "what about X" where X is an attribute (price, moq, etc.), assume they're asking about the same product from the previous question
+- If context shows they were discussing a specific product, apply their new question to that product
+- If you're unsure what they're asking about, politely ask for clarification
+
+MOQ (Minimum Order Quantity) INSTRUCTIONS:
+- If user asks about MOQ, minimum order, or minimum quantity for a product:
+  1. First check if there's an explicit "MOQ" field listed for that product
+  2. If not, search the Description field for MOQ info
+  3. If MOQ is found, state it clearly: "The MOQ for [product] is [amount]"
+  4. If no MOQ info exists, say: "I don't see a specific MOQ listed for [product]. Some products have no minimum - check the order form or ask an admin."
+
+GENERAL:
+- The Description field contains critical information including MOQ, lab details, testing info, and vendor specifics - ALWAYS read and use this information
+- Keep responses SHORT and direct"""
+
+    print(f"[DEBUG] generate_answer_with_context_async - Generating answer for: '{user_question}'")
+    print(f"[DEBUG] generate_answer_with_context_async - Using {len(products)} products, context: {bool(conversation_context)}")
+
+    response = await call_openai_with_retry_async(
+        "generate_answer_with_context_async",
+        lambda timeout: client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,  # Slightly lower for more consistent follow-ups
+            timeout=timeout
+        )
+    )
+
+    answer = response.choices[0].message.content.strip()
+    print(f"[DEBUG] generate_answer_with_context_async - Generated answer length: {len(answer)} chars")
+
+    return answer
+
+
+async def generate_answer_with_multi_form_context_async(user_question, forms_data, conversation_context=None):
+    """
+    Async version that generates answers from multiple forms with conversation context support.
+    """
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+    # Format products grouped by form
+    all_products_text = ""
+    form_titles = []
+
+    for form_info in forms_data:
+        form_title = form_info.get('form_title', 'Unknown Form')
+        products = form_info.get('products', [])
+        vendor_info = form_info.get('vendor_info', {})
+
+        form_titles.append(form_title)
+
+        if not products:
+            continue
+
+        all_products_text += f"\n=== {form_title} ===\n"
+
+        if vendor_info:
+            if vendor_info.get('vendor'):
+                all_products_text += f"Vendor: {vendor_info['vendor']}\n"
+            if vendor_info.get('deadline'):
+                all_products_text += f"Deadline: {vendor_info['deadline']}\n"
+
+        all_products_text += "\n"
+
+        for idx, product in enumerate(products, 1):
+            name = product.get('name', 'N/A')
+            price = product.get('price', 'N/A')
+            description = product.get('description', 'N/A')
+            all_products_text += f"{idx}. {name}\n   Price: ${price}\n   Description: {description}\n"
+
+            if 'moq' in product:
+                all_products_text += f"   MOQ (Minimum Order Quantity): {product['moq']}\n"
+            if 'quantity' in product:
+                all_products_text += f"   Quantity: {product['quantity']}\n"
+            if 'stock' in product:
+                all_products_text += f"   Stock: {product['stock']}\n"
+            all_products_text += "\n"
+
+    forms_list_text = ", ".join(form_titles)
+
+    # Build conversation context section
+    context_text = ""
+    if conversation_context:
+        context_parts = []
+        if conversation_context.get('last_product'):
+            context_parts.append(f"- User was previously asking about: {conversation_context['last_product']}")
+        if conversation_context.get('last_topic'):
+            context_parts.append(f"- Previous topic of discussion: {conversation_context['last_topic']}")
+        if conversation_context.get('last_message'):
+            context_parts.append(f"- User's previous message: \"{conversation_context['last_message'][:100]}\"")
+        if conversation_context.get('form_id'):
+            context_parts.append(f"- Previous form discussed: {conversation_context.get('form_title', 'Unknown')}")
+
+        if context_parts:
+            context_text = "\n\nCONVERSATION CONTEXT:\n" + "\n".join(context_parts)
+
+    prompt = f"""You are Bohemia's Steward, a helpful assistant for a Group Buy community.
+
+IMPORTANT: The user's question may apply to MULTIPLE Group Buy forms.
+
+Forms searched: {forms_list_text}
+
+{all_products_text}
+{context_text}
+
+User asked: "{user_question}"
+
+CRITICAL INSTRUCTIONS:
+- Search ALL forms listed above for relevant information
+- If the product exists in multiple forms, mention BOTH/ALL occurrences
+- Clearly indicate which form each piece of information comes from
+- ONLY answer the specific question asked
+- Be conversational and natural
+
+FOLLOW-UP QUESTION HANDLING:
+- If this is a follow-up question (short, vague, or references previous context), use the CONVERSATION CONTEXT to understand what they're asking about
+- If asking about a new attribute (price, moq), apply it to the product from context
+
+MOQ INSTRUCTIONS:
+- Check ALL forms for that product
+- Report MOQ info from EACH form where the product appears
+- If MOQ differs between forms, clearly state both
+
+GENERAL:
+- Keep responses SHORT and direct
+- Always clarify which form information comes from"""
+
+    print(f"[DEBUG] generate_answer_with_multi_form_context_async - Using {len(forms_data)} forms, context: {bool(conversation_context)}")
+
+    response = await call_openai_with_retry_async(
+        "generate_answer_with_multi_form_context_async",
+        lambda timeout: client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            timeout=timeout
+        )
+    )
+
+    answer = response.choices[0].message.content.strip()
+    print(f"[DEBUG] generate_answer_with_multi_form_context_async - Generated answer length: {len(answer)} chars")
 
     return answer
 
@@ -2545,15 +2949,22 @@ async def submit_problem_report(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         await update.message.reply_text(confirmation_msg)
 
-    # Clear user data
-    context.user_data.clear()
+    # Clear only report-related user data (preserve conversation context)
+    context.user_data.pop('report_invoice', None)
+    context.user_data.pop('report_description', None)
+    context.user_data.pop('report_photo', None)
+    context.user_data.pop('report_photo_file', None)
 
     return ConversationHandler.END
 
 
 async def report_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the problem report flow."""
-    context.user_data.clear()
+    # Clear only report-related user data (preserve conversation context)
+    context.user_data.pop('report_invoice', None)
+    context.user_data.pop('report_description', None)
+    context.user_data.pop('report_photo', None)
+    context.user_data.pop('report_photo_file', None)
     await update.message.reply_text(
         "Problem report cancelled.\n\n"
         "If you need help, you can always start a new report with /reportproblem "
@@ -3204,9 +3615,16 @@ async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             print(f"[DEBUG] conversation_timeout - Failed to send timeout message: {e}")
 
-    # Clear any user data
+    # Clear conversation handler data but preserve general conversation context
     if context and context.user_data:
-        context.user_data.clear()
+        # Clear status lookup data
+        context.user_data.pop('status_form_id', None)
+        context.user_data.pop('status_form_title', None)
+        # Clear report data
+        context.user_data.pop('report_invoice', None)
+        context.user_data.pop('report_description', None)
+        context.user_data.pop('report_photo', None)
+        context.user_data.pop('report_photo_file', None)
 
     return ConversationHandler.END
 
@@ -3309,23 +3727,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ==========================================================================
+    # CONVERSATION CONTEXT - Enable multi-turn conversations
+    # ==========================================================================
+    # Get existing conversation context (remembers what was discussed before)
+    conv_context = get_conversation_context(context)
+    print(f"[DEBUG] handle_message - Conversation context: {conv_context}")
+
+    # Check if this is a follow-up question
+    is_followup = is_followup_question(text)
+    print(f"[DEBUG] handle_message - Is follow-up question: {is_followup}")
+
+    # Extract what topic the user is asking about
+    current_topic = extract_topic_from_message(text)
+    print(f"[DEBUG] handle_message - Current topic: {current_topic}")
+
     # Try to identify which form the user is asking about using ChatGPT
     try:
         # Get all available forms
         available_forms = jotform_helper.get_all_forms()
         print(f"\n[DEBUG] handle_message - Retrieved {len(available_forms)} forms from JotFormHelper")
-        print(f"[DEBUG] handle_message - Form IDs: {list(available_forms.keys())}")
 
-        # Use ChatGPT to analyze the message and identify the form(s)
-        form_result = analyze_message_for_gb(text, available_forms)
-        print(f"[DEBUG] handle_message - analyze_message_for_gb returned: {form_result}")
+        # ==========================================================================
+        # FOLLOW-UP QUESTION HANDLING
+        # ==========================================================================
+        # If this is a follow-up question and we have context, use the previous form
+        form_result = None
+        use_context = False
 
-        # Check if we got multiple forms (list) or a single form (string)
+        if is_followup and conv_context.get('form_id'):
+            # This is a follow-up - use the previously discussed form
+            form_result = conv_context.get('form_id')
+            use_context = True
+            print(f"[DEBUG] handle_message - Using context form_id: {form_result}")
+        else:
+            # Not a follow-up or no context - analyze the message to identify the form
+            form_result = analyze_message_for_gb(text, available_forms)
+            print(f"[DEBUG] handle_message - analyze_message_for_gb returned: {form_result}")
+
+        # ==========================================================================
+        # HANDLE MULTIPLE FORMS
+        # ==========================================================================
         if isinstance(form_result, list) and len(form_result) > 1:
             # Multiple forms match - fetch products from all of them
             print(f"[DEBUG] handle_message - Multiple forms detected: {form_result}")
 
             forms_data = []
+            all_products = []
             for fid in form_result:
                 print(f"[DEBUG] handle_message - Fetching products for form_id: {fid}")
                 products = jotform_helper.get_products(fid)
@@ -3340,26 +3788,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         'products': products,
                         'vendor_info': vendor_info
                     })
+                    all_products.extend(products)
                     print(f"[DEBUG] handle_message - Form {fid} ({form_title}): {len(products)} products")
 
             if forms_data:
                 print(f"[DEBUG] handle_message - Generating multi-form answer with {len(forms_data)} forms")
-                answer = generate_answer_with_multi_form_products(text, forms_data)
+                answer = await generate_answer_with_multi_form_context_async(text, forms_data, conv_context if use_context else None)
                 await update.message.reply_text(answer)
+
+                # Update conversation context - store multiple form info
+                products_mentioned = [p.get('name') for p in all_products if text_lower in p.get('name', '').lower()][:3]
+                update_conversation_context(
+                    context,
+                    form_id=form_result[0],  # Store first form as primary
+                    form_title=forms_data[0]['form_title'],
+                    form_ids=form_result,  # Store all form IDs
+                    last_message=text[:200],
+                    last_topic=current_topic,
+                    products_discussed=products_mentioned or conv_context.get('products_discussed', []),
+                    cached_products=all_products[:50]  # Cache products for follow-ups
+                )
             else:
                 await update.message.reply_text(
                     "I found multiple forms that might match, but couldn't retrieve products from any of them. "
                     "Please try again later."
                 )
 
+        # ==========================================================================
+        # HANDLE SINGLE FORM
+        # ==========================================================================
         elif form_result:
             # Single form identified (either string or single-item list)
             form_id = form_result[0] if isinstance(form_result, list) else form_result
 
-            # Get products for the identified form
-            print(f"[DEBUG] handle_message - Fetching products for form_id: {form_id}")
-            products = jotform_helper.get_products(form_id)
-            print(f"[DEBUG] handle_message - Retrieved {len(products) if products else 0} products")
+            # Try to use cached products from context for faster follow-ups
+            products = None
+            if use_context and conv_context.get('form_id') == form_id and conv_context.get('cached_products'):
+                products = conv_context.get('cached_products')
+                print(f"[DEBUG] handle_message - Using cached products from context ({len(products)} products)")
+            else:
+                # Fetch fresh products
+                print(f"[DEBUG] handle_message - Fetching products for form_id: {form_id}")
+                products = jotform_helper.get_products(form_id)
+                print(f"[DEBUG] handle_message - Retrieved {len(products) if products else 0} products")
 
             if products:
                 # Get form title and metadata (including vendor info)
@@ -3368,26 +3839,88 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"[DEBUG] handle_message - Fetching form metadata for vendor info")
                 vendor_info = jotform_helper.get_form_metadata(form_id)
 
-                print(f"[DEBUG] handle_message - Generating conversational answer with ChatGPT")
+                print(f"[DEBUG] handle_message - Generating conversational answer with ChatGPT (context-aware)")
 
-                # Use ChatGPT to generate a natural answer to the user's question
-                answer = generate_answer_with_products(text, form_title, products, vendor_info)
+                # Use the async context-aware function to generate the answer
+                answer = await generate_answer_with_context_async(
+                    text,
+                    form_title,
+                    products,
+                    vendor_info,
+                    conversation_context=conv_context if use_context else None
+                )
 
                 # Track the product search
                 await track_event(EVENT_PRODUCT_SEARCH, user, {
                     'query': text[:100],
                     'form_id': form_id,
-                    'product_count': len(products)
+                    'product_count': len(products),
+                    'is_followup': is_followup
                 })
 
                 print(f"[DEBUG] handle_message - Sending answer to user")
                 await update.message.reply_text(answer)
+
+                # ==========================================================================
+                # UPDATE CONVERSATION CONTEXT
+                # ==========================================================================
+                # Try to identify which product was discussed (for follow-up questions)
+                product_mentioned = find_product_in_context_products(text, products)
+                product_name = product_mentioned.get('name') if product_mentioned else conv_context.get('last_product')
+
+                # Build list of products discussed in this conversation
+                products_discussed = list(conv_context.get('products_discussed', []))
+                if product_name and product_name not in products_discussed:
+                    products_discussed.append(product_name)
+
+                update_conversation_context(
+                    context,
+                    form_id=form_id,
+                    form_title=form_title,
+                    last_message=text[:200],
+                    last_topic=current_topic,
+                    last_product=product_name,
+                    products_discussed=products_discussed[:10],  # Keep last 10 products
+                    cached_products=products[:50]  # Cache for follow-ups
+                )
+
             else:
                 await update.message.reply_text(
                     "I found the form, but couldn't retrieve any products. Please try again later."
                 )
+
+        # ==========================================================================
+        # NO FORM IDENTIFIED
+        # ==========================================================================
         else:
-            # No form identified - list available forms to help the user
+            # Check if we can use context to answer
+            if conv_context.get('form_id') and conv_context.get('cached_products'):
+                # We have context - try to answer using cached data
+                print(f"[DEBUG] handle_message - No form identified but have context, using cached data")
+                form_id = conv_context['form_id']
+                form_title = conv_context.get('form_title', 'Group Buy')
+                products = conv_context.get('cached_products', [])
+
+                if products:
+                    vendor_info = jotform_helper.get_form_metadata(form_id)
+                    answer = await generate_answer_with_context_async(
+                        text,
+                        form_title,
+                        products,
+                        vendor_info,
+                        conversation_context=conv_context
+                    )
+                    await update.message.reply_text(answer)
+
+                    # Update context
+                    update_conversation_context(
+                        context,
+                        last_message=text[:200],
+                        last_topic=current_topic
+                    )
+                    return
+
+            # No context available - ask for clarification
             forms_names = [f"• {form_data['title']}" for fid, form_data in available_forms.items()]
             forms_text = "\n".join(forms_names[:5])  # Show up to 5 forms
 
@@ -3403,6 +3936,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         log_error("handle_message - Unexpected error", e, {"user_message": text})
+        import traceback
+        traceback.print_exc()
         await update.message.reply_text(
             "Sorry, I encountered an error processing your request. Please try again later."
         )
