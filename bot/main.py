@@ -1180,7 +1180,7 @@ async def clearvendors_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the current status of the Group Buy."""
     try:
-        form_id, is_manual = await get_current_gb_form_id()
+        form_id, _ = await get_current_gb_form_id()
 
         if not form_id:
             await update.message.reply_text(
@@ -1188,23 +1188,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Get form info
-        forms = jotform_helper.get_all_forms()
-        form_title = forms.get(form_id, {}).get('title', 'Current GB')
-
         # Check database for status
         db_status = await get_status()
-        status_info = await get_status_info() if db_status else None
 
         if db_status:
-            response = f"Status for {form_title}:\n\n{db_status}"
-            if status_info and status_info.get('updated_by'):
-                response += f"\n\n(Updated by @{status_info['updated_by']})"
-            await update.message.reply_text(response)
+            # Just show the raw status text, no metadata
+            await update.message.reply_text(db_status)
         else:
             await update.message.reply_text(
-                f"No status set for {form_title}.\n\n"
-                "An admin can set it with /setstatus <status update>"
+                "No status set.\n\n"
+                "An admin can set it with /setstatus"
             )
 
     except Exception as e:
