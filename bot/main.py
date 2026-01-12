@@ -886,7 +886,7 @@ async def clearcurrentgb_command(update: Update, context: ContextTypes.DEFAULT_T
 async def currentgb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show information about the current Group Buy."""
     try:
-        form_id, is_manual = await get_current_gb_form_id()
+        form_id, _ = await get_current_gb_form_id()
 
         if not form_id:
             await update.message.reply_text(
@@ -899,31 +899,21 @@ async def currentgb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         form_data = forms.get(form_id, {})
         form_title = form_data.get('title', 'Unknown')
 
-        # Get metadata (vendor, deadline)
-        metadata = jotform_helper.get_form_metadata(form_id)
-        vendor = metadata.get('vendor', 'Not specified')
-        deadline = metadata.get('deadline', 'Not specified')
+        # Get manually set deadline and vendors from database
+        deadline = await get_deadline() or "Not set"
+        vendors = await get_vendors() or "Not set"
 
         # Get product count
         products = jotform_helper.get_products(form_id)
         product_count = len(products) if products else 0
 
-        # Build response
-        source = "(manually set)" if is_manual else "(auto-detected)"
         response = (
-            f"Current Group Buy {source}:\n\n"
-            f"Form: {form_title}\n"
-            f"Vendor: {vendor}\n"
-            f"Deadline: {deadline}\n"
-            f"Products: {product_count} items\n\n"
-            f"Use /products to see the product list."
+            f"📋 {form_title}\n\n"
+            f"🏭 Vendor(s): {vendors}\n"
+            f"⏰ Deadline: {deadline}\n"
+            f"📦 Products: {product_count} items\n\n"
+            f"Use /products to see the full product list."
         )
-
-        # Add who set it if manual
-        if is_manual:
-            gb_info = await get_current_gb_info()
-            if gb_info and gb_info.get('updated_by'):
-                response += f"\nSet by: @{gb_info['updated_by']}"
 
         await update.message.reply_text(response)
 
@@ -1089,7 +1079,7 @@ async def cleardeadline_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def vendors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the vendors for the current Group Buy."""
     try:
-        form_id, is_manual = await get_current_gb_form_id()
+        form_id, _ = await get_current_gb_form_id()
 
         if not form_id:
             await update.message.reply_text(
@@ -1099,33 +1089,22 @@ async def vendors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Get form info
         forms = jotform_helper.get_all_forms()
-        form_title = forms.get(form_id, {}).get('title', 'Current GB')
+        form_title = forms.get(form_id, {}).get('title', 'the current GB')
 
         # Check database for manually set vendors
         db_vendors = await get_vendors()
-        vendors_info = await get_vendors_info() if db_vendors else None
 
         if db_vendors:
-            response = f"Vendors for {form_title}:\n\n{db_vendors}"
-            if vendors_info and vendors_info.get('updated_by'):
-                response += f"\n\n(Set by @{vendors_info['updated_by']})"
-            await update.message.reply_text(response)
+            await update.message.reply_text(
+                f"The current vendor(s) for {form_title} is {db_vendors}.\n\n"
+                "For more information on Vendor COAs, third-party test reports, "
+                "questions, or concerns, please message an admin."
+            )
         else:
-            # Try to get from JotForm metadata
-            metadata = jotform_helper.get_form_metadata(form_id)
-            vendor = metadata.get('vendor')
-            suppliers = metadata.get('suppliers', [])
-
-            if vendor:
-                await update.message.reply_text(f"Vendor for {form_title}:\n\n{vendor}")
-            elif suppliers:
-                suppliers_text = ", ".join(suppliers)
-                await update.message.reply_text(f"Vendors for {form_title}:\n\n{suppliers_text}")
-            else:
-                await update.message.reply_text(
-                    f"No vendors set for {form_title}.\n\n"
-                    "An admin can set them with /setvendors <vendor names>"
-                )
+            await update.message.reply_text(
+                f"No vendors have been set for {form_title} yet.\n\n"
+                "An admin can set them with /setvendors"
+            )
 
     except Exception as e:
         print(f"[ERROR] vendors_command: {e}")
