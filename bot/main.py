@@ -2227,9 +2227,9 @@ async def status_receive_identifier(update: Update, context: ContextTypes.DEFAUL
         result = jotform_helper.search_submission_in_form(form_id, search_value, form_title)
 
         if result and result.get('found'):
-            # Format the order display
+            # Format the order display (plain text to avoid HTML parse errors)
             response = format_order_display(result)
-            await update.message.reply_text(response, parse_mode='HTML')
+            await update.message.reply_text(response)
         else:
             await update.message.reply_text(
                 f"I couldn't find an order matching \"{search_value}\" in {form_title}.\n\n"
@@ -2268,46 +2268,48 @@ async def status_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def format_order_display(order_data):
     """
     Format the order data for display to the user.
+    Uses plain text formatting to avoid HTML parse errors from JotForm data.
 
     Args:
         order_data: dict with order information from search_submission_in_form
 
     Returns:
-        Formatted string for Telegram message
+        Formatted string for Telegram message (plain text)
     """
-    import html
-
-    # Escape HTML in all user-provided data to prevent parse errors
-    form_title = html.escape(str(order_data.get('form_title', 'Group Buy')))
-    telegram_username = html.escape(str(order_data.get('telegram_username', 'N/A')))
-    customer_name = html.escape(str(order_data.get('customer_name', '')))
-    invoice_id = html.escape(str(order_data.get('invoice_id', 'N/A')))
+    form_title = str(order_data.get('form_title', 'Group Buy'))
+    telegram_username = str(order_data.get('telegram_username', 'N/A'))
+    customer_name = str(order_data.get('customer_name', ''))
+    invoice_id = str(order_data.get('invoice_id', 'N/A'))
     products = order_data.get('products', [])
 
-    # Build the display string
+    # Build the display string using plain text (no HTML)
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"<b>{form_title}</b>",
+        f"📋 {form_title}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         ""
     ]
 
     # User info
     if telegram_username and telegram_username != 'N/A':
-        lines.append(f"<b>User:</b> @{telegram_username}")
+        lines.append(f"👤 User: @{telegram_username}")
     elif customer_name:
-        lines.append(f"<b>User:</b> {customer_name}")
+        lines.append(f"👤 User: {customer_name}")
 
-    lines.append(f"<b>Invoice Number:</b> {invoice_id}")
+    lines.append(f"🧾 Invoice: {invoice_id}")
     lines.append("")
 
     # Products list
     if products:
-        lines.append("<b>Order Items:</b>")
+        lines.append("📦 Order Items:")
         for i, product in enumerate(products, 1):
-            name = html.escape(str(product.get('name', 'Unknown Item')))
-            quantity = html.escape(str(product.get('quantity', '')))
-            price = html.escape(str(product.get('price', '')))
+            name = str(product.get('name', 'Unknown Item'))
+            # Strip any HTML tags from name
+            import re
+            name = re.sub(r'<[^>]+>', '', name)
+
+            quantity = str(product.get('quantity', ''))
+            price = str(product.get('price', ''))
 
             if quantity and price:
                 lines.append(f"  {i}. {name} (x{quantity}) - ${price}")
@@ -2316,14 +2318,14 @@ def format_order_display(order_data):
             else:
                 lines.append(f"  {i}. {name}")
     else:
-        lines.append("<i>No product details available</i>")
+        lines.append("No product details available")
 
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("<b>ORDER STATUS:</b> ")
+    lines.append("📊 ORDER STATUS")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
-    lines.append(f"<i>For status updates, check group announcements or DM @{ADMIN_USERNAME}</i>")
+    lines.append(f"For status updates, check group announcements or DM @{ADMIN_USERNAME}")
 
     return "\n".join(lines)
 
