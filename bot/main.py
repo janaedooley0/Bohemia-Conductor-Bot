@@ -240,7 +240,7 @@ class JotFormHelper:
                 try:
                     submissions = self._call_with_retry(
                         f"get_form_submissions:{form['id']}",
-                        lambda: self.client.get_form_submissions(form['id'], limit=1, orderby='created_at')
+                        lambda: self.client.get_form_submissions(form['id'], limit=1, order_by='created_at')
                     )
                     if submissions and len(submissions) > 0:
                         latest_submission = submissions[0].get('created_at', '')
