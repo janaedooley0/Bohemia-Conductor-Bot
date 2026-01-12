@@ -4,8 +4,8 @@ import asyncio
 from dotenv import load_dotenv
 from openai import OpenAI
 from jotform import JotformAPIClient
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 import json
 import re
 
@@ -27,6 +27,13 @@ CACHE_TTL_SECONDS = int(os.getenv('CACHE_TTL_SECONDS', 300))
 OPENAI_TIMEOUT_SECONDS = int(os.getenv('OPENAI_TIMEOUT_SECONDS', 30))
 OPENAI_MAX_RETRIES = int(os.getenv('OPENAI_MAX_RETRIES', 3))
 OPENAI_BACKOFF_SECONDS = float(os.getenv('OPENAI_BACKOFF_SECONDS', 1))
+
+# Admin contact for problem reports
+ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'Emilycarolinemarch')
+ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', None)  # Optional: Admin's Telegram chat ID for direct forwarding
+
+# Conversation states for multi-step interactions
+REPORT_WAITING_INVOICE, REPORT_WAITING_DESCRIPTION, REPORT_WAITING_PHOTO = range(3)
 
 
 class ExternalServiceError(Exception):
@@ -517,12 +524,92 @@ class JotFormHelper:
         print(f"\n{'='*60}")
         print(f"FOUND {len(products)} PRODUCTS")
         print(f"{'='*60}\n")
-        
+
         for product in products:
             print(f"Product: {product.get('name', 'N/A')}")
             print(f"Price: ${product.get('price', 'N/A')}")
             print(f"Description: {product.get('description', 'N/A')[:100]}...")
             print("-" * 60)
+
+    def search_submission_by_invoice(self, invoice_id):
+        """
+        Search for a submission across all forms by Invoice ID.
+        Returns submission details if found, None otherwise.
+
+        Args:
+            invoice_id: The invoice number/ID to search for
+
+        Returns:
+            dict with submission info or None if not found
+        """
+        print(f"[DEBUG] search_submission_by_invoice - Searching for invoice: {invoice_id}")
+
+        # Normalize the invoice ID (remove spaces, make uppercase for comparison)
+        invoice_normalized = str(invoice_id).strip().upper()
+
+        try:
+            forms = self.get_all_forms()
+
+            for form_id, form_data in forms.items():
+                try:
+                    # Get submissions for this form (limit to recent ones for performance)
+                    submissions = self._call_with_retry(
+                        f"get_form_submissions:{form_id}",
+                        lambda fid=form_id: self.client.get_form_submissions(fid, limit=500)
+                    )
+
+                    if not submissions:
+                        continue
+
+                    for submission in submissions:
+                        answers = submission.get('answers', {})
+
+                        # Search through all answer fields for invoice-related fields
+                        for field_id, field_data in answers.items():
+                            field_name = field_data.get('name', '').lower()
+                            field_text = field_data.get('text', '').lower()
+                            answer = str(field_data.get('answer', '')).strip().upper()
+
+                            # Check if this is an invoice field
+                            is_invoice_field = any(keyword in field_name or keyword in field_text
+                                                   for keyword in ['invoice', 'order number', 'order id',
+                                                                   'reference', 'confirmation'])
+
+                            if is_invoice_field and answer == invoice_normalized:
+                                print(f"[DEBUG] search_submission_by_invoice - Found match in form {form_id}")
+
+                                # Extract useful information from the submission
+                                result = {
+                                    'found': True,
+                                    'form_id': form_id,
+                                    'form_title': form_data.get('title', 'Unknown Form'),
+                                    'submission_id': submission.get('id'),
+                                    'created_at': submission.get('created_at'),
+                                    'status': submission.get('status', 'ACTIVE'),
+                                    'invoice_id': invoice_id
+                                }
+
+                                # Try to extract customer name/email if available
+                                for fid, fdata in answers.items():
+                                    fname = fdata.get('name', '').lower()
+                                    if 'name' in fname and 'first' in fname:
+                                        result['customer_name'] = fdata.get('answer', '')
+                                    elif 'email' in fname:
+                                        result['email'] = fdata.get('answer', '')
+
+                                return result
+
+                except Exception as e:
+                    print(f"[DEBUG] search_submission_by_invoice - Error searching form {form_id}: {e}")
+                    continue
+
+            print(f"[DEBUG] search_submission_by_invoice - No match found for invoice: {invoice_id}")
+            return None
+
+        except Exception as e:
+            print(f"[ERROR] search_submission_by_invoice - Error: {e}")
+            return None
+
 
 def generate_answer_with_products(user_question, form_title, products, vendor_info=None):
     """
@@ -1121,6 +1208,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status - Show current GB status\n"
         "/jotform - Get link to order form\n"
         "/listforms - List available order forms\n\n"
+        "Order Support:\n"
+        "/checkstatus <invoice> - Check your order status\n"
+        "/reportproblem - Report an issue with your order\n\n"
     )
 
     # Add admin commands only for admins
@@ -1676,6 +1766,320 @@ async def jotform_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
+# ORDER STATUS LOOKUP COMMAND
+# =============================================================================
+
+async def checkstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow users to check their order status by Invoice ID."""
+    if not context.args:
+        await update.message.reply_text(
+            "To check your order status, please provide your Invoice ID:\n\n"
+            "/checkstatus <your-invoice-id>\n\n"
+            "Example: /checkstatus INV-12345\n\n"
+            "You can find your Invoice ID in your order confirmation email."
+        )
+        return
+
+    invoice_id = " ".join(context.args).strip()
+
+    await update.message.reply_text("Looking up your order... please wait.")
+
+    try:
+        # Search for the submission
+        result = jotform_helper.search_submission_by_invoice(invoice_id)
+
+        if result and result.get('found'):
+            # Format the response
+            form_title = result.get('form_title', 'Group Buy')
+            created_at = result.get('created_at', 'Unknown')
+            status = result.get('status', 'ACTIVE')
+
+            # Map JotForm status to user-friendly text
+            status_map = {
+                'ACTIVE': 'Received - Being Processed',
+                'DELETED': 'Cancelled',
+                'UPDATED': 'Updated'
+            }
+            friendly_status = status_map.get(status, status)
+
+            response = (
+                f"Order Found!\n\n"
+                f"Invoice: {invoice_id}\n"
+                f"Form: {form_title}\n"
+                f"Submitted: {created_at}\n"
+                f"Status: {friendly_status}\n\n"
+                "For more details about your order status (shipping, processing, etc.), "
+                f"please check the group announcements or DM @{ADMIN_USERNAME}."
+            )
+            await update.message.reply_text(response)
+        else:
+            # Safe fallback - don't reveal too much
+            await update.message.reply_text(
+                f"I couldn't find an order with Invoice ID: {invoice_id}\n\n"
+                "This could mean:\n"
+                "- The invoice ID may be incorrect\n"
+                "- The order may have been submitted with a different ID\n"
+                "- The order may be too old to appear in recent records\n\n"
+                f"If you believe this is an error, please DM @{ADMIN_USERNAME} with your order details."
+            )
+
+    except Exception as e:
+        print(f"[ERROR] checkstatus_command: {e}")
+        await update.message.reply_text(
+            "I encountered an error while looking up your order. "
+            f"Please try again later or DM @{ADMIN_USERNAME} for assistance."
+        )
+
+
+# =============================================================================
+# REPORT A PROBLEM FEATURE (Conversation Handler)
+# =============================================================================
+
+async def reportproblem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the problem reporting flow."""
+    await update.message.reply_text(
+        "I'm sorry to hear you're having an issue with your order.\n\n"
+        "Please enter your Invoice ID so we can locate your order:\n\n"
+        "(Type /cancel at any time to cancel this report)"
+    )
+    return REPORT_WAITING_INVOICE
+
+
+async def report_receive_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive the invoice ID for the problem report."""
+    invoice_id = update.message.text.strip()
+
+    # Store the invoice ID in user context
+    context.user_data['report_invoice'] = invoice_id
+
+    await update.message.reply_text(
+        f"Invoice ID: {invoice_id}\n\n"
+        "Please describe the problem you're experiencing:\n"
+        "(Be as detailed as possible - what happened, what you expected, etc.)"
+    )
+    return REPORT_WAITING_DESCRIPTION
+
+
+async def report_receive_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive the problem description."""
+    description = update.message.text.strip()
+
+    # Store the description in user context
+    context.user_data['report_description'] = description
+
+    # Create inline keyboard for photo option
+    keyboard = [
+        [
+            InlineKeyboardButton("Yes, attach photo", callback_data="report_photo_yes"),
+            InlineKeyboardButton("No, submit now", callback_data="report_photo_no")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "Got it. Would you like to attach a photo showing the issue?\n\n"
+        "(Photos can help us understand and resolve the problem faster)",
+        reply_markup=reply_markup
+    )
+    return REPORT_WAITING_PHOTO
+
+
+async def report_photo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the photo yes/no button callback."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "report_photo_yes":
+        await query.edit_message_text(
+            "Please send a photo showing the issue.\n\n"
+            "(Just upload the image directly to this chat)"
+        )
+        return REPORT_WAITING_PHOTO
+    else:
+        # Submit without photo
+        context.user_data['report_photo'] = None
+        return await submit_problem_report(update, context, from_callback=True)
+
+
+async def report_receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive the photo for the problem report."""
+    if update.message.photo:
+        # Get the largest photo (best quality)
+        photo = update.message.photo[-1]
+        context.user_data['report_photo'] = photo.file_id
+        context.user_data['report_photo_file'] = photo
+    else:
+        context.user_data['report_photo'] = None
+
+    return await submit_problem_report(update, context)
+
+
+async def submit_problem_report(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback=False):
+    """Submit the problem report and forward to admin."""
+    user = update.effective_user
+    invoice_id = context.user_data.get('report_invoice', 'Not provided')
+    description = context.user_data.get('report_description', 'No description')
+    photo_file_id = context.user_data.get('report_photo')
+
+    # Format the report message
+    report_message = (
+        "🚨 NEW PROBLEM REPORT 🚨\n\n"
+        f"From: @{user.username or 'No username'} ({user.first_name})\n"
+        f"User ID: {user.id}\n"
+        f"Invoice ID: {invoice_id}\n\n"
+        f"Problem Description:\n{description}\n\n"
+        f"{'📷 Photo attached below' if photo_file_id else 'No photo attached'}"
+    )
+
+    # Try to forward to admin
+    admin_notified = False
+
+    if ADMIN_CHAT_ID:
+        try:
+            # Send to admin's direct chat
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=report_message
+            )
+            if photo_file_id:
+                await context.bot.send_photo(
+                    chat_id=ADMIN_CHAT_ID,
+                    photo=photo_file_id,
+                    caption=f"Photo for problem report - Invoice: {invoice_id}"
+                )
+            admin_notified = True
+        except Exception as e:
+            print(f"[ERROR] submit_problem_report - Failed to send to admin chat: {e}")
+
+    # Store the report in the database for record keeping
+    try:
+        from database import log_event
+        await log_event(
+            event_type='problem_report',
+            event_data=json.dumps({
+                'invoice_id': invoice_id,
+                'description': description,
+                'has_photo': bool(photo_file_id)
+            }),
+            user_id=user.id,
+            username=user.username
+        )
+    except Exception as e:
+        print(f"[ERROR] submit_problem_report - Failed to log event: {e}")
+
+    # Send confirmation to user
+    if from_callback:
+        await update.callback_query.edit_message_text(
+            "Your problem report has been submitted!\n\n"
+            f"Invoice: {invoice_id}\n"
+            f"Issue: {description[:100]}{'...' if len(description) > 100 else ''}\n\n"
+            f"An admin (@{ADMIN_USERNAME}) will review your report and get back to you.\n"
+            "Please be patient - they typically respond within 24-48 hours.\n\n"
+            "Thank you for letting us know about this issue!"
+        )
+    else:
+        await update.message.reply_text(
+            "Your problem report has been submitted!\n\n"
+            f"Invoice: {invoice_id}\n"
+            f"Issue: {description[:100]}{'...' if len(description) > 100 else ''}\n\n"
+            f"An admin (@{ADMIN_USERNAME}) will review your report and get back to you.\n"
+            "Please be patient - they typically respond within 24-48 hours.\n\n"
+            "Thank you for letting us know about this issue!"
+        )
+
+    # Clear user data
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+async def report_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the problem report flow."""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Problem report cancelled.\n\n"
+        "If you need help, you can always start a new report with /reportproblem "
+        f"or DM @{ADMIN_USERNAME} directly."
+    )
+    return ConversationHandler.END
+
+
+# =============================================================================
+# BOUNDARY ENFORCEMENT
+# =============================================================================
+
+def check_out_of_scope_request(message_text):
+    """
+    Check if the user's message is asking for something outside the bot's scope.
+    Returns a tuple of (is_out_of_scope, response_message).
+    """
+    message_lower = message_text.lower()
+
+    # Pricing change requests
+    pricing_keywords = [
+        'lower the price', 'reduce the price', 'cheaper', 'discount',
+        'price match', 'bulk discount', 'special price', 'negotiate price',
+        'can you lower', 'too expensive', 'lower price', 'better price',
+        'deal on', 'cut me a deal'
+    ]
+
+    # Exception/special treatment requests
+    exception_keywords = [
+        'make an exception', 'exception for me', 'special case',
+        'just this once', 'bend the rules', 'skip the', 'bypass',
+        'can you just', 'please just', 'just for me', 'as a favor'
+    ]
+
+    # Admin decision requests
+    admin_decision_keywords = [
+        'when will admin', 'tell the admin to', 'make them',
+        'force them to', 'why won\'t they', 'they should',
+        'admin needs to', 'get the admin to'
+    ]
+
+    # Negotiation attempts
+    negotiation_keywords = [
+        'what if i', 'how about', 'counter offer', 'best you can do',
+        'meet me halfway', 'split the difference', 'come down on',
+        'work with me', 'cut a deal'
+    ]
+
+    # Check for pricing requests
+    if any(keyword in message_lower for keyword in pricing_keywords):
+        return True, (
+            "I can't modify pricing or offer discounts - those decisions are made by the admins.\n\n"
+            "The prices listed on the order form are final for this Group Buy.\n\n"
+            f"If you have questions about pricing, please DM @{ADMIN_USERNAME}."
+        )
+
+    # Check for exception requests
+    if any(keyword in message_lower for keyword in exception_keywords):
+        return True, (
+            "I'm not able to make exceptions to the Group Buy rules or processes.\n\n"
+            "These policies exist to ensure fairness for all members.\n\n"
+            f"If you have a special circumstance, please DM @{ADMIN_USERNAME} to discuss."
+        )
+
+    # Check for admin decision interference
+    if any(keyword in message_lower for keyword in admin_decision_keywords):
+        return True, (
+            "I can't influence or speak on behalf of admin decisions.\n\n"
+            "Admins make decisions based on what's best for the community and logistics.\n\n"
+            f"For questions about admin decisions, please DM @{ADMIN_USERNAME} directly."
+        )
+
+    # Check for negotiations
+    if any(keyword in message_lower for keyword in negotiation_keywords):
+        return True, (
+            "I'm not set up to negotiate terms, prices, or conditions.\n\n"
+            "The Group Buy operates on fixed terms to keep things fair and simple.\n\n"
+            f"If you have concerns, please reach out to @{ADMIN_USERNAME}."
+        )
+
+    return False, None
+
+
+# =============================================================================
 # ADMIN MANAGEMENT COMMANDS
 # =============================================================================
 
@@ -1984,6 +2388,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(get_admin_redirect_message())
         return
 
+    # Check for out-of-scope requests (pricing, exceptions, negotiations)
+    is_out_of_scope, boundary_response = check_out_of_scope_request(text)
+    if is_out_of_scope:
+        print(f"[DEBUG] handle_message - Out-of-scope request detected")
+        await update.message.reply_text(boundary_response)
+        return
+
     # Check if user is asking for the JotForm link / order form
     jotform_keywords = [
         'jotform', 'jot form', 'order form', 'ordering form', 'form link',
@@ -2146,6 +2557,8 @@ async def post_init(application):
         BotCommand("status", "Show current GB status"),
         BotCommand("jotform", "Get link to order form"),
         BotCommand("listforms", "List available order forms"),
+        BotCommand("checkstatus", "Check your order status"),
+        BotCommand("reportproblem", "Report an issue with your order"),
     ]
     await application.bot.set_my_commands(commands)
     print("[STARTUP] Bot commands registered with Telegram.")
@@ -2168,6 +2581,29 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("jotform", jotform_command))
     app.add_handler(CommandHandler("listforms", listforms_command))
+
+    # Register command handlers - Order Support
+    app.add_handler(CommandHandler("checkstatus", checkstatus_command))
+
+    # Report Problem Conversation Handler (must be before generic message handler)
+    report_problem_handler = ConversationHandler(
+        entry_points=[CommandHandler("reportproblem", reportproblem_command)],
+        states={
+            REPORT_WAITING_INVOICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, report_receive_invoice)
+            ],
+            REPORT_WAITING_DESCRIPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, report_receive_description)
+            ],
+            REPORT_WAITING_PHOTO: [
+                CallbackQueryHandler(report_photo_callback, pattern="^report_photo_"),
+                MessageHandler(filters.PHOTO, report_receive_photo),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", report_cancel)],
+        allow_reentry=True
+    )
+    app.add_handler(report_problem_handler)
 
     # Register command handlers - Admin
     app.add_handler(CommandHandler("setcurrentgb", setcurrentgb_command))
