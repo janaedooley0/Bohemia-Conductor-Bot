@@ -40,6 +40,53 @@ def log_error(context, error, extra=None):
             print(f"[ERROR] {context} - {key}: {value}")
 
 
+def extract_moq_from_description(description):
+    """
+    Extract MOQ (Minimum Order Quantity) from product description text.
+    Returns the MOQ string if found, None otherwise.
+
+    Common patterns:
+    - "MOQ: 10", "MOQ 10", "MOQ:10"
+    - "Min order: 5", "Min order 5", "Minimum order: 5"
+    - "Minimum order quantity: 10"
+    - "Min qty: 5", "Min qty 5"
+    - "Minimum: 10 units", "Min: 5"
+    - "10 unit minimum", "5 vial minimum"
+    """
+    if not description or description == 'N/A':
+        return None
+
+    description_lower = description.lower()
+
+    # Pattern list - ordered by specificity (most specific first)
+    patterns = [
+        # MOQ explicit patterns
+        r'moq[:\s]*(\d+(?:\s*(?:units?|vials?|bottles?|pieces?|pcs?|kits?))?)',
+        r'minimum\s+order\s+(?:quantity|qty)?[:\s]*(\d+(?:\s*(?:units?|vials?|bottles?|pieces?|pcs?|kits?))?)',
+        r'min(?:imum)?\s+order[:\s]*(\d+(?:\s*(?:units?|vials?|bottles?|pieces?|pcs?|kits?))?)',
+        r'min(?:imum)?\s+qty[:\s]*(\d+(?:\s*(?:units?|vials?|bottles?|pieces?|pcs?|kits?))?)',
+        r'min[:\s]+(\d+(?:\s*(?:units?|vials?|bottles?|pieces?|pcs?|kits?))?)',
+        # Reverse patterns: "10 unit minimum"
+        r'(\d+)\s*(?:units?|vials?|bottles?|pieces?|pcs?|kits?)?\s+min(?:imum)?(?:\s+order)?',
+        # Simple "minimum X" at word boundary
+        r'\bminimum[:\s]*(\d+)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, description_lower)
+        if match:
+            moq_value = match.group(1).strip()
+            # Clean up and format the result
+            if moq_value:
+                # If it's just a number, add "units"
+                if moq_value.isdigit():
+                    moq_value = f"{moq_value} units"
+                print(f"[DEBUG] extract_moq_from_description - Found MOQ: '{moq_value}' using pattern: {pattern}")
+                return moq_value
+
+    return None
+
+
 def call_openai_with_retry(operation_name, call_fn, max_retries=OPENAI_MAX_RETRIES,
                            backoff_seconds=OPENAI_BACKOFF_SECONDS,
                            timeout_seconds=OPENAI_TIMEOUT_SECONDS):
@@ -100,9 +147,12 @@ FAQ_DATABASE = {
         "keywords": ["refund", "money back", "return", "cancel order", "cancellation", "get refund"],
         "answer": "Refund and cancellation policies vary by Group Buy. Generally:\n- Orders can be modified/cancelled before the GB deadline\n- After the deadline, changes may not be possible as orders are already placed with vendors\n- Issues with received products are handled case-by-case\n\nFor specific refund requests, please DM an admin with your order details."
     },
-    "minimum order": {
-        "keywords": ["minimum order", "min order", "moq", "minimum quantity", "minimum purchase", "smallest order"],
-        "answer": "Minimum Order Quantities (MOQ) vary by product and are listed in each product's description on the order form. Some products have no minimum, while others require a minimum quantity to be ordered. Check the specific product listing for MOQ details."
+    # Note: MOQ questions are now handled by the intelligent product lookup system
+    # which extracts MOQ from product descriptions and uses ChatGPT to answer
+    # specific product MOQ queries. General "what is MOQ" questions still need handling.
+    "what is moq": {
+        "keywords": ["what is moq", "what's moq", "what does moq mean", "moq meaning", "what is minimum order quantity"],
+        "answer": "MOQ stands for Minimum Order Quantity - it's the smallest amount of a product you can order. MOQs vary by product. Ask me about a specific product to get its MOQ! For example: 'What's the MOQ for Retatrutide?'"
     },
 
     # Contact & Support
@@ -436,17 +486,25 @@ class JotFormHelper:
     def clean_products(self, products):
         clean_products_list = []
         for product in products:
+            description = product.get('description', 'N/A')
             product_data = {
                 'name': product.get('name', 'N/A'),
                 'price': product.get('price', 'N/A'),
-                'description': product.get('description', 'N/A')
+                'description': description
             }
 
-            # Try to extract MOQ and other potentially useful fields
+            # Try to extract MOQ from explicit field first
+            if 'moq' in product and product.get('moq'):
+                product_data['moq'] = product.get('moq')
+            else:
+                # Try to extract MOQ from description text
+                extracted_moq = extract_moq_from_description(description)
+                if extracted_moq:
+                    product_data['moq'] = extracted_moq
+
+            # Extract other potentially useful fields
             if 'quantity' in product:
                 product_data['quantity'] = product.get('quantity')
-            if 'moq' in product:
-                product_data['moq'] = product.get('moq')
             if 'stock' in product:
                 product_data['stock'] = product.get('stock')
 
@@ -522,8 +580,17 @@ CRITICAL INSTRUCTIONS:
 - Match product abbreviations (Reta=Retatrutide, R30=products with 30, etc.)
 - For ambiguous product names, ask for clarification
 - For timeline questions: "4-8 weeks depending on customs, production, and shipping. Subject to delays for custom batches, seizures, or international shipping."
-- IMPORTANT: The Description field contains critical information including MOQ, lab details, testing info, and vendor specifics - ALWAYS read and use this information when answering questions
-- If asked about MOQ, lab info, testing, or vendor details, search the Description field carefully
+
+MOQ (Minimum Order Quantity) INSTRUCTIONS:
+- If user asks about MOQ, minimum order, or minimum quantity for a product:
+  1. First check if there's an explicit "MOQ" field listed for that product
+  2. If not, search the Description field for MOQ info (look for "MOQ:", "minimum order", "min order", "X units minimum", etc.)
+  3. If MOQ is found, state it clearly: "The MOQ for [product] is [amount]"
+  4. If no MOQ info exists for the product, say: "I don't see a specific MOQ listed for [product]. Some products have no minimum - check the order form or ask an admin."
+- Be specific about which product's MOQ you're answering about
+
+GENERAL:
+- The Description field contains critical information including MOQ, lab details, testing info, and vendor specifics - ALWAYS read and use this information
 - Keep responses SHORT and direct"""
 
     print(f"[DEBUG] generate_answer_with_products - Generating answer for: '{user_question}'")
@@ -543,6 +610,31 @@ CRITICAL INSTRUCTIONS:
     print(f"[DEBUG] generate_answer_with_products - Generated answer length: {len(answer)} chars")
 
     return answer
+
+def is_moq_question(message_text):
+    """
+    Detect if user is asking about MOQ/minimum order for a specific product.
+    Returns True if this appears to be a product-specific MOQ question.
+    """
+    message_lower = message_text.lower()
+
+    # MOQ-related keywords
+    moq_keywords = [
+        'moq', 'minimum order', 'min order', 'minimum quantity', 'min quantity',
+        'minimum purchase', 'min purchase', 'how many do i need', 'how many needed',
+        'smallest order', 'minimum amount', 'min amount', 'minimum to order',
+        'at least order', 'minimum i can order', 'minimum can order'
+    ]
+
+    # Check if message contains MOQ keywords
+    has_moq_keyword = any(keyword in message_lower for keyword in moq_keywords)
+
+    if has_moq_keyword:
+        print(f"[DEBUG] is_moq_question - MOQ question detected in: '{message_text}'")
+        return True
+
+    return False
+
 
 def check_for_coa_test_question(message_text):
     """
