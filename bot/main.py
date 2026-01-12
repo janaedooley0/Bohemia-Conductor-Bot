@@ -1553,7 +1553,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/jotform - Get link to order form\n"
         "/listforms - List available order forms\n\n"
         "Order Support:\n"
-        "/checkstatus <invoice> - Check your order status\n"
+        "/getorderstatus - Look up your order status\n"
         "/reportproblem - Report an issue with your order\n\n"
     )
 
@@ -2126,7 +2126,7 @@ async def jotform_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ORDER STATUS LOOKUP COMMAND (Interactive Conversation Handler)
 # =============================================================================
 
-async def checkstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def getorderstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the order status lookup flow with form selection."""
     try:
         # Get forms from the curated list
@@ -2168,7 +2168,7 @@ async def checkstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return STATUS_WAITING_FORM
 
     except Exception as e:
-        print(f"[ERROR] checkstatus_command: {e}")
+        print(f"[ERROR] getorderstatus_command: {e}")
         await update.message.reply_text(
             "I encountered an error. Please try again later or "
             f"DM @{ADMIN_USERNAME} for assistance."
@@ -2216,7 +2216,7 @@ async def status_receive_identifier(update: Update, context: ContextTypes.DEFAUL
 
     if not form_id:
         await update.message.reply_text(
-            "Something went wrong. Please start over with /checkstatus"
+            "Something went wrong. Please start over with /getorderstatus"
         )
         return ConversationHandler.END
 
@@ -2260,7 +2260,7 @@ async def status_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('status_form_title', None)
     await update.message.reply_text(
         "Order lookup cancelled.\n"
-        "Use /checkstatus to start again."
+        "Use /getorderstatus to start again."
     )
     return ConversationHandler.END
 
@@ -3367,7 +3367,7 @@ async def post_init(application):
         BotCommand("status", "Show current GB status"),
         BotCommand("jotform", "Get link to order form"),
         BotCommand("listforms", "List available order forms"),
-        BotCommand("checkstatus", "Check your order status"),
+        BotCommand("getorderstatus", "Check your order status"),
         BotCommand("reportproblem", "Report an issue with your order"),
         BotCommand("subscribe", "Subscribe to deadline reminders"),
         BotCommand("unsubscribe", "Unsubscribe from reminders"),
@@ -3397,7 +3397,7 @@ def main():
     # Register command handlers - Order Support (Conversation Handlers)
     # Check Status Conversation Handler with timeout
     check_status_handler = ConversationHandler(
-        entry_points=[CommandHandler("checkstatus", checkstatus_command)],
+        entry_points=[CommandHandler("getorderstatus", getorderstatus_command)],
         states={
             STATUS_WAITING_FORM: [
                 CallbackQueryHandler(status_form_selected, pattern="^status_")
