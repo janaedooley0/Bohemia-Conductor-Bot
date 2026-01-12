@@ -34,6 +34,8 @@ ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', None)  # Optional: Admin's Telegram c
 
 # Conversation states for multi-step interactions
 REPORT_WAITING_INVOICE, REPORT_WAITING_DESCRIPTION, REPORT_WAITING_PHOTO = range(3)
+# Check status conversation states
+STATUS_WAITING_FORM, STATUS_WAITING_IDENTIFIER = range(10, 12)
 
 
 class ExternalServiceError(Exception):
@@ -608,6 +610,127 @@ class JotFormHelper:
 
         except Exception as e:
             print(f"[ERROR] search_submission_by_invoice - Error: {e}")
+            return None
+
+    def search_submission_in_form(self, form_id, search_value, form_title=None):
+        """
+        Search for a submission in a specific form by invoice ID, name, or Telegram username.
+        Returns full submission details including products ordered.
+
+        Args:
+            form_id: The JotForm form ID to search
+            search_value: The value to search for (invoice, name, or TG username)
+            form_title: Optional form title (for response)
+
+        Returns:
+            dict with full submission info or None if not found
+        """
+        print(f"[DEBUG] search_submission_in_form - Searching form {form_id} for: {search_value}")
+
+        search_normalized = str(search_value).strip().lower()
+
+        try:
+            # Get submissions for this form
+            submissions = self._call_with_retry(
+                f"get_form_submissions:{form_id}",
+                lambda: self.client.get_form_submissions(form_id, limit=500)
+            )
+
+            if not submissions:
+                print(f"[DEBUG] search_submission_in_form - No submissions found in form {form_id}")
+                return None
+
+            for submission in submissions:
+                answers = submission.get('answers', {})
+                match_found = False
+
+                # Collect all data from this submission
+                submission_data = {
+                    'found': False,
+                    'form_id': form_id,
+                    'form_title': form_title or 'Group Buy',
+                    'submission_id': submission.get('id'),
+                    'created_at': submission.get('created_at'),
+                    'status': submission.get('status', 'ACTIVE'),
+                    'invoice_id': None,
+                    'customer_name': None,
+                    'telegram_username': None,
+                    'email': None,
+                    'products': [],
+                    'raw_answers': {}
+                }
+
+                # First pass: extract all relevant fields
+                for field_id, field_data in answers.items():
+                    field_name = field_data.get('name', '').lower()
+                    field_text = field_data.get('text', '').lower()
+                    answer = field_data.get('answer', '')
+                    answer_str = str(answer).strip() if answer else ''
+                    answer_lower = answer_str.lower()
+
+                    # Store raw answer for reference
+                    submission_data['raw_answers'][field_name or field_text] = answer_str
+
+                    # Check for invoice field
+                    if any(kw in field_name or kw in field_text for kw in ['invoice', 'order number', 'order id', 'reference', 'confirmation']):
+                        submission_data['invoice_id'] = answer_str
+                        if answer_lower == search_normalized or search_normalized in answer_lower:
+                            match_found = True
+
+                    # Check for name fields
+                    if any(kw in field_name or kw in field_text for kw in ['name', 'full name', 'first name', 'last name']):
+                        if submission_data['customer_name']:
+                            submission_data['customer_name'] += ' ' + answer_str
+                        else:
+                            submission_data['customer_name'] = answer_str
+                        if answer_lower == search_normalized or search_normalized in answer_lower:
+                            match_found = True
+
+                    # Check for Telegram username
+                    if any(kw in field_name or kw in field_text for kw in ['telegram', 'tg', 'username', 'tg username', 'telegram username']):
+                        # Clean up @ symbol if present
+                        tg_username = answer_str.lstrip('@')
+                        submission_data['telegram_username'] = tg_username
+                        if tg_username.lower() == search_normalized.lstrip('@') or search_normalized.lstrip('@') in tg_username.lower():
+                            match_found = True
+
+                    # Check for email
+                    if 'email' in field_name or 'email' in field_text:
+                        submission_data['email'] = answer_str
+                        if answer_lower == search_normalized:
+                            match_found = True
+
+                    # Check for products (usually in product list or order items)
+                    if any(kw in field_name or kw in field_text for kw in ['product', 'item', 'order', 'purchase']):
+                        if isinstance(answer, list):
+                            for item in answer:
+                                if isinstance(item, dict):
+                                    product_name = item.get('name', item.get('text', str(item)))
+                                    quantity = item.get('quantity', item.get('qty', '1'))
+                                    price = item.get('price', item.get('amount', ''))
+                                    submission_data['products'].append({
+                                        'name': product_name,
+                                        'quantity': quantity,
+                                        'price': price
+                                    })
+                                else:
+                                    submission_data['products'].append({'name': str(item), 'quantity': '1', 'price': ''})
+                        elif answer_str:
+                            # Could be a text description of products
+                            submission_data['products'].append({'name': answer_str, 'quantity': '', 'price': ''})
+
+                if match_found:
+                    submission_data['found'] = True
+                    print(f"[DEBUG] search_submission_in_form - Match found! Invoice: {submission_data['invoice_id']}")
+                    return submission_data
+
+            print(f"[DEBUG] search_submission_in_form - No match found for: {search_value}")
+            return None
+
+        except Exception as e:
+            print(f"[ERROR] search_submission_in_form - Error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
 
@@ -1766,69 +1889,206 @@ async def jotform_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# ORDER STATUS LOOKUP COMMAND
+# ORDER STATUS LOOKUP COMMAND (Interactive Conversation Handler)
 # =============================================================================
 
 async def checkstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allow users to check their order status by Invoice ID."""
-    if not context.args:
-        await update.message.reply_text(
-            "To check your order status, please provide your Invoice ID:\n\n"
-            "/checkstatus <your-invoice-id>\n\n"
-            "Example: /checkstatus INV-12345\n\n"
-            "You can find your Invoice ID in your order confirmation email."
-        )
-        return
-
-    invoice_id = " ".join(context.args).strip()
-
-    await update.message.reply_text("Looking up your order... please wait.")
-
+    """Start the order status lookup flow with form selection."""
     try:
-        # Search for the submission
-        result = jotform_helper.search_submission_by_invoice(invoice_id)
+        # Get forms from the curated list
+        forms_list = await get_forms_list()
 
-        if result and result.get('found'):
-            # Format the response
-            form_title = result.get('form_title', 'Group Buy')
-            created_at = result.get('created_at', 'Unknown')
-            status = result.get('status', 'ACTIVE')
+        if not forms_list:
+            # Fallback to all forms if no curated list
+            all_forms = jotform_helper.get_all_forms()
+            forms_list = [{'form_id': fid, 'form_title': fdata.get('title', 'Unknown')}
+                          for fid, fdata in all_forms.items()]
 
-            # Map JotForm status to user-friendly text
-            status_map = {
-                'ACTIVE': 'Received - Being Processed',
-                'DELETED': 'Cancelled',
-                'UPDATED': 'Updated'
-            }
-            friendly_status = status_map.get(status, status)
-
-            response = (
-                f"Order Found!\n\n"
-                f"Invoice: {invoice_id}\n"
-                f"Form: {form_title}\n"
-                f"Submitted: {created_at}\n"
-                f"Status: {friendly_status}\n\n"
-                "For more details about your order status (shipping, processing, etc.), "
-                f"please check the group announcements or DM @{ADMIN_USERNAME}."
-            )
-            await update.message.reply_text(response)
-        else:
-            # Safe fallback - don't reveal too much
+        if not forms_list:
             await update.message.reply_text(
-                f"I couldn't find an order with Invoice ID: {invoice_id}\n\n"
-                "This could mean:\n"
-                "- The invoice ID may be incorrect\n"
-                "- The order may have been submitted with a different ID\n"
-                "- The order may be too old to appear in recent records\n\n"
-                f"If you believe this is an error, please DM @{ADMIN_USERNAME} with your order details."
+                "No Group Buy forms are currently available.\n"
+                f"Please DM @{ADMIN_USERNAME} for assistance."
             )
+            return ConversationHandler.END
+
+        # Create inline keyboard with form options
+        keyboard = []
+        for form in forms_list[:10]:  # Limit to 10 forms for UI
+            form_id = form['form_id']
+            title = form['form_title']
+            # Truncate long titles
+            display_title = title[:30] + "..." if len(title) > 30 else title
+            keyboard.append([InlineKeyboardButton(display_title, callback_data=f"status_form_{form_id}")])
+
+        # Add cancel button
+        keyboard.append([InlineKeyboardButton("Cancel", callback_data="status_cancel")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            "Let's look up your order status.\n\n"
+            "Please select the Group Buy your order is from:",
+            reply_markup=reply_markup
+        )
+
+        return STATUS_WAITING_FORM
 
     except Exception as e:
         print(f"[ERROR] checkstatus_command: {e}")
         await update.message.reply_text(
-            "I encountered an error while looking up your order. "
+            "I encountered an error. Please try again later or "
+            f"DM @{ADMIN_USERNAME} for assistance."
+        )
+        return ConversationHandler.END
+
+
+async def status_form_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle form selection from inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "status_cancel":
+        await query.edit_message_text("Order lookup cancelled.")
+        return ConversationHandler.END
+
+    # Extract form ID from callback data
+    form_id = query.data.replace("status_form_", "")
+
+    # Get form title
+    forms = jotform_helper.get_all_forms()
+    form_title = forms.get(form_id, {}).get('title', 'Selected Group Buy')
+
+    # Store in user context
+    context.user_data['status_form_id'] = form_id
+    context.user_data['status_form_title'] = form_title
+
+    await query.edit_message_text(
+        f"Selected: {form_title}\n\n"
+        "Now, please enter ONE of the following to find your order:\n\n"
+        "• Your Invoice Number (from your confirmation email)\n"
+        "• Your name (as entered on the form)\n"
+        "• Your Telegram username\n\n"
+        "(Type /cancel to cancel)"
+    )
+
+    return STATUS_WAITING_IDENTIFIER
+
+
+async def status_receive_identifier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive the identifier and look up the order."""
+    search_value = update.message.text.strip()
+    form_id = context.user_data.get('status_form_id')
+    form_title = context.user_data.get('status_form_title', 'Group Buy')
+
+    if not form_id:
+        await update.message.reply_text(
+            "Something went wrong. Please start over with /checkstatus"
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text("🔍 Searching for your order... please wait.")
+
+    try:
+        # Search for the submission
+        result = jotform_helper.search_submission_in_form(form_id, search_value, form_title)
+
+        if result and result.get('found'):
+            # Format the order display
+            response = format_order_display(result)
+            await update.message.reply_text(response, parse_mode='HTML')
+        else:
+            await update.message.reply_text(
+                f"I couldn't find an order matching \"{search_value}\" in {form_title}.\n\n"
+                "This could mean:\n"
+                "• The information entered doesn't match our records\n"
+                "• The order may be under a different name/email\n"
+                "• The order may not have been submitted yet\n\n"
+                f"If you believe this is an error, please DM @{ADMIN_USERNAME} with your order details."
+            )
+
+    except Exception as e:
+        print(f"[ERROR] status_receive_identifier: {e}")
+        await update.message.reply_text(
+            "I encountered an error while looking up your order.\n"
             f"Please try again later or DM @{ADMIN_USERNAME} for assistance."
         )
+
+    # Clear user data
+    context.user_data.pop('status_form_id', None)
+    context.user_data.pop('status_form_title', None)
+
+    return ConversationHandler.END
+
+
+async def status_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the status lookup flow."""
+    context.user_data.pop('status_form_id', None)
+    context.user_data.pop('status_form_title', None)
+    await update.message.reply_text(
+        "Order lookup cancelled.\n"
+        "Use /checkstatus to start again."
+    )
+    return ConversationHandler.END
+
+
+def format_order_display(order_data):
+    """
+    Format the order data for display to the user.
+
+    Args:
+        order_data: dict with order information from search_submission_in_form
+
+    Returns:
+        Formatted string for Telegram message
+    """
+    form_title = order_data.get('form_title', 'Group Buy')
+    telegram_username = order_data.get('telegram_username', 'N/A')
+    customer_name = order_data.get('customer_name', '')
+    invoice_id = order_data.get('invoice_id', 'N/A')
+    products = order_data.get('products', [])
+
+    # Build the display string
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"<b>{form_title}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    # User info
+    if telegram_username and telegram_username != 'N/A':
+        lines.append(f"<b>User:</b> @{telegram_username}")
+    elif customer_name:
+        lines.append(f"<b>User:</b> {customer_name}")
+
+    lines.append(f"<b>Invoice Number:</b> {invoice_id}")
+    lines.append("")
+
+    # Products list
+    if products:
+        lines.append("<b>Order Items:</b>")
+        for i, product in enumerate(products, 1):
+            name = product.get('name', 'Unknown Item')
+            quantity = product.get('quantity', '')
+            price = product.get('price', '')
+
+            if quantity and price:
+                lines.append(f"  {i}. {name} (x{quantity}) - ${price}")
+            elif quantity:
+                lines.append(f"  {i}. {name} (x{quantity})")
+            else:
+                lines.append(f"  {i}. {name}")
+    else:
+        lines.append("<i>No product details available</i>")
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("<b>ORDER STATUS:</b> ")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
+    lines.append(f"<i>For status updates, check group announcements or DM @{ADMIN_USERNAME}</i>")
+
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -2582,8 +2842,22 @@ def main():
     app.add_handler(CommandHandler("jotform", jotform_command))
     app.add_handler(CommandHandler("listforms", listforms_command))
 
-    # Register command handlers - Order Support
-    app.add_handler(CommandHandler("checkstatus", checkstatus_command))
+    # Register command handlers - Order Support (Conversation Handlers)
+    # Check Status Conversation Handler
+    check_status_handler = ConversationHandler(
+        entry_points=[CommandHandler("checkstatus", checkstatus_command)],
+        states={
+            STATUS_WAITING_FORM: [
+                CallbackQueryHandler(status_form_selected, pattern="^status_")
+            ],
+            STATUS_WAITING_IDENTIFIER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, status_receive_identifier)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", status_cancel)],
+        allow_reentry=True
+    )
+    app.add_handler(check_status_handler)
 
     # Report Problem Conversation Handler (must be before generic message handler)
     report_problem_handler = ConversationHandler(
