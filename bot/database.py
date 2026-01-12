@@ -51,6 +51,17 @@ async def init_db():
             )
         ''')
 
+        # Forms list table (curated list of forms to show in /listforms)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS forms_list (
+                form_id TEXT PRIMARY KEY,
+                form_title TEXT,
+                added_at TEXT,
+                added_by_user_id INTEGER,
+                added_by_username TEXT
+            )
+        ''')
+
         await db.commit()
         print(f"[DEBUG] Database initialized at {DB_PATH}")
 
@@ -296,3 +307,59 @@ async def get_event_count(event_type: str, since: str = None) -> int:
             ) as cursor:
                 row = await cursor.fetchone()
         return row[0] if row else 0
+
+
+# =============================================================================
+# FORMS LIST FUNCTIONS (curated list for /listforms)
+# =============================================================================
+
+async def add_form_to_list(form_id: str, form_title: str, user_id: int = None, username: str = None):
+    """Add a form to the curated forms list."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO forms_list (form_id, form_title, added_at, added_by_user_id, added_by_username)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(form_id) DO UPDATE SET
+                form_title = excluded.form_title,
+                added_at = excluded.added_at,
+                added_by_user_id = excluded.added_by_user_id,
+                added_by_username = excluded.added_by_username
+        ''', (form_id, form_title, datetime.now().isoformat(), user_id, username))
+        await db.commit()
+        print(f"[DEBUG] Form added to list: {form_title} ({form_id}) by {username}")
+
+
+async def remove_form_from_list(form_id: str):
+    """Remove a form from the curated forms list."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('DELETE FROM forms_list WHERE form_id = ?', (form_id,))
+        await db.commit()
+        print(f"[DEBUG] Form removed from list: {form_id}")
+
+
+async def get_forms_list():
+    """Get all forms in the curated list."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT form_id, form_title, added_at, added_by_username FROM forms_list ORDER BY added_at DESC'
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {
+                    'form_id': row[0],
+                    'form_title': row[1],
+                    'added_at': row[2],
+                    'added_by': row[3]
+                }
+                for row in rows
+            ]
+
+
+async def is_form_in_list(form_id: str) -> bool:
+    """Check if a form is in the curated list."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT 1 FROM forms_list WHERE form_id = ?', (form_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
