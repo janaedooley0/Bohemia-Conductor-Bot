@@ -533,6 +533,68 @@ class JotFormHelper:
             print(f"Description: {product.get('description', 'N/A')[:100]}...")
             print("-" * 60)
 
+    def _parse_payment_items(self, answer, pretty_format):
+        items = []
+
+        if isinstance(answer, list):
+            for item in answer:
+                if isinstance(item, dict):
+                    name = item.get('name') or item.get('text') or item.get('product')
+                    quantity = item.get('quantity') or item.get('qty') or item.get('count')
+                    price = item.get('price') or item.get('amount') or item.get('total')
+                    if name:
+                        items.append({'name': name, 'quantity': quantity or '', 'price': price or ''})
+                elif item:
+                    items.append({'name': str(item), 'quantity': '', 'price': ''})
+        elif isinstance(answer, dict):
+            for key in ['paymentItems', 'products', 'items']:
+                if key in answer and isinstance(answer[key], list):
+                    for item in answer[key]:
+                        if not isinstance(item, dict):
+                            continue
+                        name = item.get('name') or item.get('text') or item.get('product')
+                        quantity = item.get('quantity') or item.get('qty') or item.get('count')
+                        price = item.get('price') or item.get('amount') or item.get('total')
+                        if name:
+                            items.append({'name': name, 'quantity': quantity or '', 'price': price or ''})
+
+        if pretty_format:
+            lines = [line.strip() for line in str(pretty_format).splitlines() if line.strip()]
+            for line in lines:
+                match = re.match(
+                    r'^(?P<name>.+?)(?:\s*\(x(?P<qty>\d+)\))?(?:\s*x(?P<qty_alt>\d+))?(?:\s*-\s*\$?(?P<price>[\d.,]+))?$',
+                    line
+                )
+                if match:
+                    name = match.group('name').strip()
+                    quantity = match.group('qty') or match.group('qty_alt') or ''
+                    price = match.group('price') or ''
+                    if name:
+                        items.append({'name': name, 'quantity': quantity, 'price': price})
+
+        return items
+
+    def _add_products_from_items(self, submission_data, items):
+        for item in items:
+            name = item.get('name')
+            if not name:
+                continue
+            quantity = item.get('quantity', '')
+            price = item.get('price', '')
+            signature = (name.strip().lower(), str(quantity).strip(), str(price).strip())
+            existing = {
+                (p.get('name', '').strip().lower(),
+                 str(p.get('quantity', '')).strip(),
+                 str(p.get('price', '')).strip())
+                for p in submission_data['products']
+            }
+            if signature not in existing:
+                submission_data['products'].append({
+                    'name': name,
+                    'quantity': quantity,
+                    'price': price
+                })
+
     def search_submission_by_invoice(self, invoice_id):
         """
         Search for a submission across all forms by Invoice ID.
@@ -751,22 +813,13 @@ class JotFormHelper:
 
                     # Check for products (payment field or product list)
                     if field_type == 'control_payment' or any(kw in field_name or kw in field_text for kw in ['product', 'item', 'purchase']):
-                        if isinstance(answer, list):
-                            for item in answer:
-                                if isinstance(item, dict):
-                                    product_name = item.get('name', item.get('text', str(item)))
-                                    quantity = item.get('quantity', item.get('qty', '1'))
-                                    price = item.get('price', item.get('amount', ''))
-                                    if product_name:
-                                        submission_data['products'].append({
-                                            'name': product_name,
-                                            'quantity': quantity,
-                                            'price': price
-                                        })
-                                elif item:
-                                    submission_data['products'].append({'name': str(item), 'quantity': '1', 'price': ''})
-                        elif answer_str and answer_str != 'N/A':
-                            submission_data['products'].append({'name': answer_str, 'quantity': '', 'price': ''})
+                        items = self._parse_payment_items(answer, pretty_format or answer_str)
+                        self._add_products_from_items(submission_data, items)
+                        if not items and answer_str and answer_str != 'N/A':
+                            self._add_products_from_items(
+                                submission_data,
+                                [{'name': answer_str, 'quantity': '', 'price': ''}]
+                            )
 
                 # If no specific field match, do a broad search across all values
                 if not match_found:
