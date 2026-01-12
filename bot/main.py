@@ -16,7 +16,8 @@ from database import (
     get_all_admins, get_admin_count, get_deadline, set_deadline,
     clear_deadline, get_deadline_info, get_vendors, set_vendors,
     clear_vendors, get_vendors_info, get_status, set_status,
-    clear_status, get_status_info
+    clear_status, get_status_info, add_form_to_list, remove_form_from_list,
+    get_forms_list, is_form_in_list
 )
 
 load_dotenv()
@@ -684,7 +685,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show available commands and how to use the bot."""
-    await update.message.reply_text(
+    user = update.effective_user
+    user_is_admin = await is_admin(user.id)
+
+    # Base help message for all users
+    help_text = (
         "Available Commands:\n\n"
         "General:\n"
         "/start - Welcome message\n"
@@ -698,24 +703,37 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/vendors - Show current GB vendors\n"
         "/status - Show current GB status\n"
         "/jotform - Get link to order form\n"
-        "/listforms - List all available forms\n\n"
-        "Admin Commands:\n"
-        "/setcurrentgb <id or name> - Set current GB\n"
-        "/clearcurrentgb - Clear GB setting\n"
-        "/setdeadline <date> - Set deadline\n"
-        "/cleardeadline - Clear deadline\n"
-        "/setvendors <names> - Set vendors\n"
-        "/clearvendors - Clear vendors\n"
-        "/setstatus <text> - Set status\n"
-        "/clearstatus - Clear status\n"
-        "/refresh - Refresh cached data\n"
-        "/addadmin - Add a bot admin\n"
-        "/removeadmin <id> - Remove an admin\n"
-        "/listadmins - List all admins\n\n"
+        "/listforms - List available order forms\n\n"
+    )
+
+    # Add admin commands only for admins
+    if user_is_admin:
+        help_text += (
+            "Admin Commands:\n"
+            "/setcurrentgb <id or name> - Set current GB\n"
+            "/clearcurrentgb - Clear GB setting\n"
+            "/setdeadline <date> - Set deadline\n"
+            "/cleardeadline - Clear deadline\n"
+            "/setvendors <names> - Set vendors\n"
+            "/clearvendors - Clear vendors\n"
+            "/setstatus <text> - Set status\n"
+            "/clearstatus - Clear status\n"
+            "/refresh - Refresh cached data\n"
+            "/addadmin - Add a bot admin\n"
+            "/removeadmin <id> - Remove an admin\n"
+            "/listadmins - List all admins\n"
+            "/listallforms - List all JotForm forms\n"
+            "/addformtolist <id> - Add form to public list\n"
+            "/removeformfromlist <id> - Remove form from list\n\n"
+        )
+
+    help_text += (
         "Or just ask me questions like:\n"
         "- 'What's the price of Retatrutide?'\n"
         "- 'How do I place an order?'"
     )
+
+    await update.message.reply_text(help_text)
 
 async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show list of FAQ topics."""
@@ -787,29 +805,30 @@ async def get_current_gb_form_id():
 # =============================================================================
 
 async def listforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all available JotForm forms with their IDs."""
+    """List forms from the curated list (open GBs managed by admins)."""
     try:
-        forms = jotform_helper.get_all_forms()
-        if not forms:
-            await update.message.reply_text("No forms found.")
-            return
+        # Get the curated forms list from database
+        forms_list = await get_forms_list()
 
-        # Sort by latest submission date
-        sorted_forms = sorted(
-            forms.items(),
-            key=lambda x: x[1].get('latest_submission', x[1].get('created', '')),
-            reverse=True
-        )
+        if not forms_list:
+            await update.message.reply_text(
+                "No forms are currently available.\n"
+                "Please check back later or ask an admin."
+            )
+            return
 
         # Get current GB to mark it
         current_gb_id, is_manual = await get_current_gb_form_id()
 
-        lines = ["Available Forms:\n"]
-        for idx, (form_id, form_data) in enumerate(sorted_forms, 1):
-            title = form_data.get('title', 'Untitled')
+        lines = ["Available Order Forms:\n"]
+        for idx, form in enumerate(forms_list, 1):
+            form_id = form['form_id']
+            title = form['form_title']
             marker = " [CURRENT]" if form_id == current_gb_id else ""
-            lines.append(f"{idx}. {title}{marker}\n   ID: {form_id}")
+            jotform_url = f"https://form.jotform.com/{form_id}"
+            lines.append(f"{idx}. {title}{marker}\n   {jotform_url}")
 
+        lines.append("\nClick a link to place your order!")
         await update.message.reply_text("\n".join(lines))
 
     except Exception as e:
@@ -1335,6 +1354,185 @@ async def listadmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(lines))
 
 
+# =============================================================================
+# FORMS LIST MANAGEMENT COMMANDS
+# =============================================================================
+
+async def addformtolist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to add a form to the curated forms list shown by /listforms."""
+    user = update.effective_user
+
+    # Check if user is admin
+    if not await is_admin(user.id):
+        await update.message.reply_text("Only admins can add forms to the list.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /addformtolist <form_id or search term>\n\n"
+            "Examples:\n"
+            "/addformtolist 253411113426040\n"
+            "/addformtolist December\n"
+            "/addformtolist QSC\n\n"
+            "This adds a form to the curated list shown by /listforms."
+        )
+        return
+
+    search_term = " ".join(context.args)
+    forms = jotform_helper.get_all_forms()
+
+    # Try to find the form
+    found_form_id = None
+    found_form_title = None
+
+    # First, check if it's an exact form ID
+    if search_term in forms:
+        found_form_id = search_term
+        found_form_title = forms[search_term].get('title', 'Unknown')
+    else:
+        # Search by title (case-insensitive)
+        search_lower = search_term.lower()
+        for form_id, form_data in forms.items():
+            title = form_data.get('title', '').lower()
+            if search_lower in title:
+                found_form_id = form_id
+                found_form_title = form_data.get('title', 'Unknown')
+                break
+
+    if found_form_id:
+        # Check if already in list
+        if await is_form_in_list(found_form_id):
+            await update.message.reply_text(
+                f"'{found_form_title}' is already in the forms list."
+            )
+            return
+
+        # Add to list
+        await add_form_to_list(
+            found_form_id,
+            found_form_title,
+            user_id=user.id,
+            username=user.username or user.first_name
+        )
+        await update.message.reply_text(
+            f"Added to forms list:\n"
+            f"{found_form_title}\n"
+            f"(ID: {found_form_id})\n\n"
+            "Users will now see this form when using /listforms."
+        )
+    else:
+        await update.message.reply_text(
+            f"Could not find a form matching '{search_term}'.\n\n"
+            "Use /listallforms to see all available JotForm forms."
+        )
+
+
+async def removeformfromlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to remove a form from the curated forms list."""
+    user = update.effective_user
+
+    # Check if user is admin
+    if not await is_admin(user.id):
+        await update.message.reply_text("Only admins can remove forms from the list.")
+        return
+
+    if not context.args:
+        # Show current forms list to help admin choose
+        forms_list = await get_forms_list()
+        if not forms_list:
+            await update.message.reply_text("The forms list is empty. Nothing to remove.")
+            return
+
+        lines = ["Current forms in list:\n"]
+        for idx, form in enumerate(forms_list, 1):
+            lines.append(f"{idx}. {form['form_title']}\n   ID: {form['form_id']}")
+
+        lines.append("\nUsage: /removeformfromlist <form_id or search term>")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    search_term = " ".join(context.args)
+    forms_list = await get_forms_list()
+
+    # Try to find the form in the list
+    found_form = None
+
+    # First, check if it's an exact form ID
+    for form in forms_list:
+        if form['form_id'] == search_term:
+            found_form = form
+            break
+
+    # If not found by ID, search by title
+    if not found_form:
+        search_lower = search_term.lower()
+        for form in forms_list:
+            if search_lower in form['form_title'].lower():
+                found_form = form
+                break
+
+    if found_form:
+        await remove_form_from_list(found_form['form_id'])
+        await update.message.reply_text(
+            f"Removed from forms list:\n"
+            f"{found_form['form_title']}\n"
+            f"(ID: {found_form['form_id']})"
+        )
+    else:
+        await update.message.reply_text(
+            f"Could not find a form matching '{search_term}' in the forms list.\n\n"
+            "Use /removeformfromlist without arguments to see the current list."
+        )
+
+
+async def listallforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to list ALL JotForm forms (for adding to the curated list)."""
+    user = update.effective_user
+
+    # Check if user is admin
+    if not await is_admin(user.id):
+        await update.message.reply_text("Only admins can view all forms.")
+        return
+
+    try:
+        forms = jotform_helper.get_all_forms()
+        if not forms:
+            await update.message.reply_text("No forms found in JotForm.")
+            return
+
+        # Sort by latest submission date
+        sorted_forms = sorted(
+            forms.items(),
+            key=lambda x: x[1].get('latest_submission', x[1].get('created', '')),
+            reverse=True
+        )
+
+        # Get current forms list to mark which are already added
+        forms_list = await get_forms_list()
+        forms_in_list = {f['form_id'] for f in forms_list}
+
+        # Get current GB to mark it
+        current_gb_id, is_manual = await get_current_gb_form_id()
+
+        lines = ["All JotForm Forms:\n"]
+        for idx, (form_id, form_data) in enumerate(sorted_forms, 1):
+            title = form_data.get('title', 'Untitled')
+            markers = []
+            if form_id == current_gb_id:
+                markers.append("CURRENT")
+            if form_id in forms_in_list:
+                markers.append("IN LIST")
+            marker_str = f" [{', '.join(markers)}]" if markers else ""
+            lines.append(f"{idx}. {title}{marker_str}\n   ID: {form_id}")
+
+        lines.append("\nUse /addformtolist <id> to add a form to the public list.")
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        print(f"[ERROR] listallforms_command: {e}")
+        await update.message.reply_text("Error retrieving forms. Please try again.")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     text_lower = text.lower()
@@ -1422,6 +1620,7 @@ async def post_init(application):
     print("[STARTUP] Database initialized.")
 
     # Register bot commands with Telegram (shows in command menu when user types '/')
+    # Only register user-facing commands - admin commands are hidden from menu
     commands = [
         BotCommand("start", "Welcome message"),
         BotCommand("help", "Show all commands"),
@@ -1432,18 +1631,7 @@ async def post_init(application):
         BotCommand("vendors", "Show current GB vendors"),
         BotCommand("status", "Show current GB status"),
         BotCommand("jotform", "Get link to order form"),
-        BotCommand("listforms", "List all available forms"),
-        BotCommand("setcurrentgb", "Set current GB (admin)"),
-        BotCommand("clearcurrentgb", "Clear GB setting (admin)"),
-        BotCommand("setdeadline", "Set deadline (admin)"),
-        BotCommand("cleardeadline", "Clear deadline (admin)"),
-        BotCommand("setvendors", "Set vendors (admin)"),
-        BotCommand("clearvendors", "Clear vendors (admin)"),
-        BotCommand("setstatus", "Set status (admin)"),
-        BotCommand("clearstatus", "Clear status (admin)"),
-        BotCommand("refresh", "Refresh cached data (admin)"),
-        BotCommand("addadmin", "Add a bot admin"),
-        BotCommand("listadmins", "List all admins"),
+        BotCommand("listforms", "List available order forms"),
     ]
     await application.bot.set_my_commands(commands)
     print("[STARTUP] Bot commands registered with Telegram.")
@@ -1480,6 +1668,9 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_command))
     app.add_handler(CommandHandler("removeadmin", removeadmin_command))
     app.add_handler(CommandHandler("listadmins", listadmins_command))
+    app.add_handler(CommandHandler("listallforms", listallforms_command))
+    app.add_handler(CommandHandler("addformtolist", addformtolist_command))
+    app.add_handler(CommandHandler("removeformfromlist", removeformfromlist_command))
 
     # Register message handler for non-command messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
