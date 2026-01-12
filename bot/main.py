@@ -77,8 +77,8 @@ FAQ_DATABASE = {
 
     # Order Process
     "how to order": {
-        "keywords": ["how to order", "how do i order", "how can i order", "place an order", "make an order", "ordering process", "how to place order", "how to buy", "how do i buy"],
-        "answer": "To place an order:\n1. Find the current Group Buy form (ask about the 'current GB')\n2. Fill out the JotForm with your product selections\n3. Submit your order before the deadline\n4. Follow the payment instructions provided\n5. Wait for shipping confirmation\n\nIf you need help with a specific step, please ask!"
+        "keywords": ["how to order", "how do i order", "how can i order", "place an order", "make an order", "ordering process", "how to place order", "how to buy", "how do i buy", "want to order", "want to place an order", "i want to order", "i want to place", "i'd like to order", "i would like to order", "ready to order", "submit an order", "fill out order"],
+        "answer": "To place an order, use /jotform to get the current order form link!\n\nThe ordering process:\n1. Click the JotForm link\n2. Fill out the form with your product selections\n3. Submit your order before the deadline\n4. Follow the payment instructions provided\n5. Wait for shipping confirmation\n\nIf you need help with a specific step, please ask!"
     },
     "how to pay": {
         "keywords": ["how to pay", "payment method", "payment options", "how do i pay", "accepted payment", "pay for order", "payment instructions"],
@@ -1661,6 +1661,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[DEBUG] handle_message - COA/test question detected, redirecting to admins")
         await update.message.reply_text(get_admin_redirect_message())
         return
+
+    # Check if user is asking for the JotForm link / order form
+    jotform_keywords = [
+        'jotform', 'jot form', 'order form', 'ordering form', 'form link',
+        'where is the form', "where's the form", 'link to form', 'link to order',
+        'get the form', 'give me the form', 'send me the form', 'need the form',
+        'where can i order', 'where do i order', 'where to order',
+        'form for the gb', 'form for the current', 'form for current gb',
+        'current gb form', 'gb form', 'group buy form'
+    ]
+    if any(keyword in text_lower for keyword in jotform_keywords):
+        print(f"[DEBUG] handle_message - JotForm link request detected")
+        try:
+            form_id, is_manual = await get_current_gb_form_id()
+            if form_id:
+                forms = jotform_helper.get_all_forms()
+                form_title = forms.get(form_id, {}).get('title', 'Current GB')
+                jotform_url = f"https://form.jotform.com/{form_id}"
+                await update.message.reply_text(
+                    f"Here's the order form for {form_title}:\n\n"
+                    f"{jotform_url}\n\n"
+                    "Click the link above to place your order!"
+                )
+            else:
+                await update.message.reply_text(
+                    "No current GB form is set. Please check back later or DM an admin for assistance."
+                )
+            return
+        except Exception as e:
+            print(f"[ERROR] handle_message - JotForm link lookup failed: {e}")
+            await update.message.reply_text(
+                "I had trouble fetching the form link. Try /jotform or ask an admin."
+            )
+            return
 
     # Check FAQ database first (fast, no API calls needed)
     faq_answer = check_faq_match(text)
