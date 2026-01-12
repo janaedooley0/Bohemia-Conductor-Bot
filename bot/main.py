@@ -17,8 +17,14 @@ from database import (
     clear_deadline, get_deadline_info, get_vendors, set_vendors,
     clear_vendors, get_vendors_info, get_status, set_status,
     clear_status, get_status_info, add_form_to_list, remove_form_from_list,
-    get_forms_list, is_form_in_list
+    get_forms_list, is_form_in_list, log_event, get_event_count,
+    get_analytics_summary, get_recent_events, subscribe_to_reminders,
+    unsubscribe_from_reminders, is_subscribed_to_reminders,
+    get_all_reminder_subscribers, get_reminder_subscriber_count,
+    log_sent_reminder
 )
+from datetime import datetime, timedelta
+from dateutil import parser as date_parser
 
 load_dotenv()
 
@@ -37,9 +43,111 @@ REPORT_WAITING_INVOICE, REPORT_WAITING_DESCRIPTION, REPORT_WAITING_PHOTO = range
 # Check status conversation states
 STATUS_WAITING_FORM, STATUS_WAITING_IDENTIFIER = range(10, 12)
 
+# Conversation timeout (in seconds) - conversations expire after this time
+CONVERSATION_TIMEOUT = int(os.getenv('CONVERSATION_TIMEOUT_SECONDS', 300))  # 5 minutes default
+
+# Analytics event types
+EVENT_COMMAND = 'command'
+EVENT_MESSAGE = 'message'
+EVENT_FAQ_MATCH = 'faq_match'
+EVENT_PRODUCT_SEARCH = 'product_search'
+EVENT_ORDER_LOOKUP = 'order_lookup'
+EVENT_PROBLEM_REPORT = 'problem_report'
+EVENT_ADMIN_ACTION = 'admin_action'
+EVENT_ERROR = 'error'
+EVENT_GREETING = 'greeting'
+EVENT_REMINDER_SENT = 'reminder_sent'
+
 
 class ExternalServiceError(Exception):
     """Raised when an external service call fails after retries."""
+
+
+async def track_event(event_type: str, user=None, data: dict = None):
+    """
+    Track an analytics event.
+    This is a fire-and-forget helper - errors are logged but don't affect the caller.
+    """
+    try:
+        user_id = user.id if user else None
+        username = (user.username or user.first_name) if user else None
+        event_data = json.dumps(data) if data else None
+        await log_event(event_type, event_data, user_id, username)
+    except Exception as e:
+        print(f"[DEBUG] track_event failed: {e}")
+
+
+async def notify_admins(context, message: str, photo_file_id: str = None):
+    """
+    Send a notification to all admins.
+    If ADMIN_CHAT_ID is set, sends to that chat. Otherwise, sends to all registered admins.
+    """
+    sent_count = 0
+
+    # Try ADMIN_CHAT_ID first
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=message)
+            if photo_file_id:
+                await context.bot.send_photo(chat_id=int(ADMIN_CHAT_ID), photo=photo_file_id)
+            sent_count += 1
+        except Exception as e:
+            print(f"[ERROR] notify_admins - Failed to send to ADMIN_CHAT_ID: {e}")
+
+    # Also notify all registered admins
+    try:
+        admins = await get_all_admins()
+        for admin in admins:
+            try:
+                # Only send if different from ADMIN_CHAT_ID
+                if ADMIN_CHAT_ID and str(admin['user_id']) == str(ADMIN_CHAT_ID):
+                    continue
+                await context.bot.send_message(chat_id=admin['user_id'], text=message)
+                if photo_file_id:
+                    await context.bot.send_photo(chat_id=admin['user_id'], photo=photo_file_id)
+                sent_count += 1
+            except Exception as e:
+                print(f"[DEBUG] notify_admins - Failed to send to admin {admin['user_id']}: {e}")
+    except Exception as e:
+        print(f"[ERROR] notify_admins - Failed to get admins: {e}")
+
+    return sent_count
+
+
+def validate_date_input(date_string: str):
+    """
+    Validate and parse a date string.
+    Returns (parsed_date, error_message) tuple.
+    """
+    if not date_string or not date_string.strip():
+        return None, "Please provide a date."
+
+    try:
+        # Try to parse with dateutil for flexibility
+        parsed = date_parser.parse(date_string, fuzzy=True)
+        return parsed, None
+    except Exception:
+        return None, f"Could not parse '{date_string}' as a date. Try formats like 'January 15, 2025' or '01/15/2025'."
+
+
+def validate_form_id(form_id: str, available_forms: dict):
+    """
+    Validate a form ID exists.
+    Returns (form_id, form_title, error_message) tuple.
+    """
+    if not form_id:
+        return None, None, "Please provide a form ID."
+
+    if form_id in available_forms:
+        return form_id, available_forms[form_id].get('title', 'Unknown'), None
+
+    # Try to find by title
+    form_id_lower = form_id.lower()
+    for fid, fdata in available_forms.items():
+        if form_id_lower in fdata.get('title', '').lower():
+            return fid, fdata.get('title', 'Unknown'), None
+
+    return None, None, f"Could not find a form matching '{form_id}'."
 
 
 def log_error(context, error, extra=None):
@@ -1410,6 +1518,9 @@ jotform_helper = JotFormHelper()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome message for new users."""
+    user = update.effective_user
+    await track_event(EVENT_COMMAND, user, {'command': 'start'})
+
     await update.message.reply_text(
         "Hello! I'm Bohemia's Steward, your Group Buy assistant.\n\n"
         "I can help you with:\n"
@@ -1422,6 +1533,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show available commands and how to use the bot."""
     user = update.effective_user
+    await track_event(EVENT_COMMAND, user, {'command': 'help'})
     user_is_admin = await is_admin(user.id)
 
     # Base help message for all users
@@ -1467,10 +1579,23 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     help_text += (
+        "Reminders:\n"
+        "/subscribe - Subscribe to deadline reminders\n"
+        "/unsubscribe - Unsubscribe from reminders\n\n"
         "Or just ask me questions like:\n"
         "- 'What's the price of Retatrutide?'\n"
         "- 'How do I place an order?'"
     )
+
+    # Add analytics command for admins
+    if user_is_admin:
+        help_text = help_text.replace(
+            "Reminders:",
+            "Analytics:\n"
+            "/analytics - View bot usage statistics\n"
+            "/broadcast <msg> - Send message to all subscribers\n\n"
+            "Reminders:"
+        )
 
     await update.message.reply_text(help_text)
 
@@ -2723,9 +2848,309 @@ async def listallforms_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Error retrieving forms. Please try again.")
 
 
+# =============================================================================
+# ANALYTICS COMMAND (Admin only)
+# =============================================================================
+
+async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to view bot usage analytics."""
+    user = update.effective_user
+
+    # Check if user is admin
+    if not await is_admin(user.id):
+        await update.message.reply_text("Only admins can view analytics.")
+        return
+
+    await track_event(EVENT_ADMIN_ACTION, user, {'action': 'view_analytics'})
+
+    try:
+        # Get analytics summary for last 7 days
+        days = 7
+        if context.args:
+            try:
+                days = int(context.args[0])
+                days = min(max(days, 1), 90)  # Clamp between 1 and 90 days
+            except ValueError:
+                pass
+
+        summary = await get_analytics_summary(days)
+
+        # Format the response
+        lines = [
+            f"Bot Analytics (Last {days} days)",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"Total Events: {summary['total_events']}",
+            f"Unique Users: {summary['unique_users']}",
+            f"Reminder Subscribers: {await get_reminder_subscriber_count()}",
+            "",
+            "Events by Type:",
+        ]
+
+        for event_type, count in summary['by_type'].items():
+            lines.append(f"  • {event_type}: {count}")
+
+        if summary['daily']:
+            lines.append("")
+            lines.append("Daily Activity:")
+            for date, count in list(summary['daily'].items())[:7]:  # Last 7 days
+                lines.append(f"  • {date}: {count} events")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        print(f"[ERROR] analytics_command: {e}")
+        await update.message.reply_text("Error retrieving analytics. Please try again.")
+
+
+# =============================================================================
+# REMINDER SUBSCRIPTION COMMANDS
+# =============================================================================
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Subscribe to deadline reminders."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    await track_event(EVENT_COMMAND, user, {'command': 'subscribe'})
+
+    try:
+        # Check if already subscribed
+        if await is_subscribed_to_reminders(user.id):
+            await update.message.reply_text(
+                "You're already subscribed to deadline reminders.\n"
+                "Use /unsubscribe to stop receiving reminders."
+            )
+            return
+
+        # Subscribe the user
+        await subscribe_to_reminders(user.id, chat_id, user.username or user.first_name)
+
+        await update.message.reply_text(
+            "You're now subscribed to deadline reminders.\n\n"
+            "You'll receive notifications when GB deadlines are approaching.\n"
+            "Use /unsubscribe to stop receiving reminders."
+        )
+
+    except Exception as e:
+        print(f"[ERROR] subscribe_command: {e}")
+        await update.message.reply_text("Error subscribing. Please try again.")
+
+
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unsubscribe from deadline reminders."""
+    user = update.effective_user
+
+    await track_event(EVENT_COMMAND, user, {'command': 'unsubscribe'})
+
+    try:
+        # Check if subscribed
+        if not await is_subscribed_to_reminders(user.id):
+            await update.message.reply_text(
+                "You're not currently subscribed to reminders.\n"
+                "Use /subscribe to start receiving deadline reminders."
+            )
+            return
+
+        # Unsubscribe the user
+        await unsubscribe_from_reminders(user.id)
+
+        await update.message.reply_text(
+            "You've been unsubscribed from deadline reminders.\n"
+            "You can re-subscribe anytime with /subscribe."
+        )
+
+    except Exception as e:
+        print(f"[ERROR] unsubscribe_command: {e}")
+        await update.message.reply_text("Error unsubscribing. Please try again.")
+
+
+# =============================================================================
+# BROADCAST COMMAND (Admin only)
+# =============================================================================
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to broadcast a message to all reminder subscribers."""
+    user = update.effective_user
+
+    # Check if user is admin
+    if not await is_admin(user.id):
+        await update.message.reply_text("Only admins can send broadcast messages.")
+        return
+
+    # Get the message to broadcast
+    raw_text = update.message.text
+    command_end = raw_text.find(' ')
+
+    if command_end == -1 or not raw_text[command_end:].strip():
+        subscriber_count = await get_reminder_subscriber_count()
+        await update.message.reply_text(
+            f"Usage: /broadcast <message>\n\n"
+            f"This will send a message to all {subscriber_count} reminder subscribers.\n\n"
+            f"Example:\n"
+            f"/broadcast Deadline reminder: January GB closes tomorrow at midnight!"
+        )
+        return
+
+    message = raw_text[command_end + 1:]
+
+    await track_event(EVENT_ADMIN_ACTION, user, {'action': 'broadcast', 'message_length': len(message)})
+
+    try:
+        subscribers = await get_all_reminder_subscribers()
+
+        if not subscribers:
+            await update.message.reply_text("No subscribers to broadcast to.")
+            return
+
+        # Send progress message
+        await update.message.reply_text(
+            f"Broadcasting to {len(subscribers)} subscribers..."
+        )
+
+        # Broadcast the message
+        sent_count = 0
+        failed_count = 0
+        broadcast_text = f"📢 Announcement from Bohemia:\n\n{message}"
+
+        for subscriber in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=subscriber['chat_id'],
+                    text=broadcast_text
+                )
+                sent_count += 1
+            except Exception as e:
+                print(f"[DEBUG] broadcast_command - Failed to send to {subscriber['user_id']}: {e}")
+                failed_count += 1
+
+        # Log the broadcast
+        await log_sent_reminder('broadcast', None, message, sent_count)
+
+        await update.message.reply_text(
+            f"Broadcast complete.\n"
+            f"Sent: {sent_count}\n"
+            f"Failed: {failed_count}"
+        )
+
+    except Exception as e:
+        print(f"[ERROR] broadcast_command: {e}")
+        await update.message.reply_text("Error sending broadcast. Please try again.")
+
+
+# =============================================================================
+# SEND DEADLINE REMINDER (Admin only)
+# =============================================================================
+
+async def sendreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to manually send a deadline reminder to all subscribers."""
+    user = update.effective_user
+
+    # Check if user is admin
+    if not await is_admin(user.id):
+        await update.message.reply_text("Only admins can send reminders.")
+        return
+
+    await track_event(EVENT_ADMIN_ACTION, user, {'action': 'send_reminder'})
+
+    try:
+        # Get current GB and deadline
+        form_id, _ = await get_current_gb_form_id()
+        deadline = await get_deadline()
+
+        if not form_id:
+            await update.message.reply_text(
+                "No current GB is set. Use /setcurrentgb first."
+            )
+            return
+
+        if not deadline:
+            await update.message.reply_text(
+                "No deadline is set. Use /setdeadline first."
+            )
+            return
+
+        # Get form info
+        forms = jotform_helper.get_all_forms()
+        form_title = forms.get(form_id, {}).get('title', 'Current GB')
+
+        # Build reminder message
+        jotform_url = f"https://form.jotform.com/{form_id}"
+        reminder_message = (
+            f"⏰ Deadline Reminder\n\n"
+            f"The deadline for {form_title} is: {deadline}\n\n"
+            f"Don't forget to place your order!\n"
+            f"Order form: {jotform_url}"
+        )
+
+        # Get subscribers
+        subscribers = await get_all_reminder_subscribers()
+
+        if not subscribers:
+            await update.message.reply_text("No subscribers to remind.")
+            return
+
+        # Send progress message
+        await update.message.reply_text(
+            f"Sending deadline reminder to {len(subscribers)} subscribers..."
+        )
+
+        # Send reminders
+        sent_count = 0
+        failed_count = 0
+
+        for subscriber in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=subscriber['chat_id'],
+                    text=reminder_message
+                )
+                sent_count += 1
+            except Exception as e:
+                print(f"[DEBUG] sendreminder_command - Failed to send to {subscriber['user_id']}: {e}")
+                failed_count += 1
+
+        # Log the reminder
+        await log_sent_reminder('deadline', deadline, reminder_message, sent_count)
+
+        await update.message.reply_text(
+            f"Deadline reminder sent.\n"
+            f"Sent: {sent_count}\n"
+            f"Failed: {failed_count}"
+        )
+
+    except Exception as e:
+        print(f"[ERROR] sendreminder_command: {e}")
+        await update.message.reply_text("Error sending reminder. Please try again.")
+
+
+# =============================================================================
+# CONVERSATION TIMEOUT HANDLER
+# =============================================================================
+
+async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle conversation timeout - called when conversation expires."""
+    # Try to send a timeout message if we have a way to reach the user
+    if update and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="This conversation has timed out due to inactivity.\n"
+                     "Please start again with the appropriate command."
+            )
+        except Exception as e:
+            print(f"[DEBUG] conversation_timeout - Failed to send timeout message: {e}")
+
+    # Clear any user data
+    if context and context.user_data:
+        context.user_data.clear()
+
+    return ConversationHandler.END
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     text_lower = text.lower().strip()
+    user = update.effective_user
 
     # Handle greetings and casual messages quickly (no API calls needed)
     greetings = ['hello', 'hi', 'hey', 'howdy', 'hola', 'yo', 'sup', 'whats up', "what's up",
@@ -2735,6 +3160,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check for simple greetings
     if any(text_lower == g or text_lower.startswith(g + ' ') or text_lower.startswith(g + '!')
            or text_lower.startswith(g + ',') for g in greetings):
+        await track_event(EVENT_GREETING, user, {'type': 'greeting'})
         await update.message.reply_text(
             "Hello! I'm Bohemia's Steward. How can I help you today?\n\n"
             "You can ask me about products, prices, or use /help to see available commands."
@@ -2743,11 +3169,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check for thanks
     if any(t in text_lower for t in thanks):
+        await track_event(EVENT_GREETING, user, {'type': 'thanks'})
         await update.message.reply_text("You're welcome! Let me know if you need anything else.")
         return
 
     # Check for goodbye
     if text_lower in ['bye', 'goodbye', 'see ya', 'later', 'cya']:
+        await track_event(EVENT_GREETING, user, {'type': 'goodbye'})
         await update.message.reply_text("Goodbye! Feel free to reach out anytime.")
         return
 
@@ -2802,6 +3230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     faq_answer = check_faq_match(text)
     if faq_answer:
         print(f"[DEBUG] handle_message - FAQ match found, returning static answer")
+        await track_event(EVENT_FAQ_MATCH, user, {'query': text[:100]})
         await update.message.reply_text(faq_answer)
         return
 
@@ -2880,6 +3309,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Use ChatGPT to generate a natural answer to the user's question
                 answer = generate_answer_with_products(text, form_title, products, vendor_info)
 
+                # Track the product search
+                await track_event(EVENT_PRODUCT_SEARCH, user, {
+                    'query': text[:100],
+                    'form_id': form_id,
+                    'product_count': len(products)
+                })
+
                 print(f"[DEBUG] handle_message - Sending answer to user")
                 await update.message.reply_text(answer)
             else:
@@ -2928,6 +3364,8 @@ async def post_init(application):
         BotCommand("listforms", "List available order forms"),
         BotCommand("checkstatus", "Check your order status"),
         BotCommand("reportproblem", "Report an issue with your order"),
+        BotCommand("subscribe", "Subscribe to deadline reminders"),
+        BotCommand("unsubscribe", "Unsubscribe from reminders"),
     ]
     await application.bot.set_my_commands(commands)
     print("[STARTUP] Bot commands registered with Telegram.")
@@ -2952,7 +3390,7 @@ def main():
     app.add_handler(CommandHandler("listforms", listforms_command))
 
     # Register command handlers - Order Support (Conversation Handlers)
-    # Check Status Conversation Handler
+    # Check Status Conversation Handler with timeout
     check_status_handler = ConversationHandler(
         entry_points=[CommandHandler("checkstatus", checkstatus_command)],
         states={
@@ -2962,14 +3400,18 @@ def main():
             STATUS_WAITING_IDENTIFIER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, status_receive_identifier)
             ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, conversation_timeout)
+            ],
         },
         fallbacks=[CommandHandler("cancel", status_cancel)],
         allow_reentry=True,
-        per_message=False
+        per_message=False,
+        conversation_timeout=CONVERSATION_TIMEOUT
     )
     app.add_handler(check_status_handler)
 
-    # Report Problem Conversation Handler (must be before generic message handler)
+    # Report Problem Conversation Handler with timeout (must be before generic message handler)
     report_problem_handler = ConversationHandler(
         entry_points=[CommandHandler("reportproblem", reportproblem_command)],
         states={
@@ -2983,12 +3425,20 @@ def main():
                 CallbackQueryHandler(report_photo_callback, pattern="^report_photo_"),
                 MessageHandler(filters.PHOTO, report_receive_photo),
             ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, conversation_timeout)
+            ],
         },
         fallbacks=[CommandHandler("cancel", report_cancel)],
         allow_reentry=True,
-        per_message=False
+        per_message=False,
+        conversation_timeout=CONVERSATION_TIMEOUT
     )
     app.add_handler(report_problem_handler)
+
+    # Register command handlers - Reminders
+    app.add_handler(CommandHandler("subscribe", subscribe_command))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
 
     # Register command handlers - Admin
     app.add_handler(CommandHandler("setcurrentgb", setcurrentgb_command))
@@ -3006,6 +3456,11 @@ def main():
     app.add_handler(CommandHandler("listallforms", listallforms_command))
     app.add_handler(CommandHandler("addformtolist", addformtolist_command))
     app.add_handler(CommandHandler("removeformfromlist", removeformfromlist_command))
+
+    # Register command handlers - Admin Analytics & Broadcast
+    app.add_handler(CommandHandler("analytics", analytics_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("sendreminder", sendreminder_command))
 
     # Register message handler for non-command messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

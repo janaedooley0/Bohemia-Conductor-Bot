@@ -62,6 +62,29 @@ async def init_db():
             )
         ''')
 
+        # Reminder subscriptions table (users who want deadline reminders)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS reminder_subscriptions (
+                user_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                username TEXT,
+                subscribed_at TEXT,
+                enabled INTEGER DEFAULT 1
+            )
+        ''')
+
+        # Scheduled reminders table (for tracking sent reminders)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS scheduled_reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reminder_type TEXT NOT NULL,
+                target_date TEXT,
+                message TEXT,
+                sent_at TEXT,
+                sent_to_count INTEGER DEFAULT 0
+            )
+        ''')
+
         await db.commit()
         print(f"[DEBUG] Database initialized at {DB_PATH}")
 
@@ -309,6 +332,100 @@ async def get_event_count(event_type: str, since: str = None) -> int:
         return row[0] if row else 0
 
 
+async def get_analytics_summary(days: int = 7):
+    """
+    Get analytics summary for the last N days.
+    Returns dict with event counts by type and daily breakdown.
+    """
+    from datetime import datetime, timedelta
+
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Get counts by event type
+        async with db.execute(
+            '''SELECT event_type, COUNT(*) as count
+               FROM analytics
+               WHERE timestamp >= ?
+               GROUP BY event_type
+               ORDER BY count DESC''',
+            (since,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            by_type = {row[0]: row[1] for row in rows}
+
+        # Get total events
+        async with db.execute(
+            'SELECT COUNT(*) FROM analytics WHERE timestamp >= ?',
+            (since,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            total = row[0] if row else 0
+
+        # Get unique users
+        async with db.execute(
+            'SELECT COUNT(DISTINCT user_id) FROM analytics WHERE timestamp >= ? AND user_id IS NOT NULL',
+            (since,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            unique_users = row[0] if row else 0
+
+        # Get daily counts
+        async with db.execute(
+            '''SELECT DATE(timestamp) as date, COUNT(*) as count
+               FROM analytics
+               WHERE timestamp >= ?
+               GROUP BY DATE(timestamp)
+               ORDER BY date DESC''',
+            (since,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            daily = {row[0]: row[1] for row in rows}
+
+        return {
+            'total_events': total,
+            'unique_users': unique_users,
+            'by_type': by_type,
+            'daily': daily,
+            'period_days': days
+        }
+
+
+async def get_recent_events(limit: int = 20, event_type: str = None):
+    """Get the most recent events, optionally filtered by type."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if event_type:
+            async with db.execute(
+                '''SELECT event_type, event_data, user_id, username, timestamp
+                   FROM analytics
+                   WHERE event_type = ?
+                   ORDER BY timestamp DESC
+                   LIMIT ?''',
+                (event_type, limit)
+            ) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            async with db.execute(
+                '''SELECT event_type, event_data, user_id, username, timestamp
+                   FROM analytics
+                   ORDER BY timestamp DESC
+                   LIMIT ?''',
+                (limit,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        return [
+            {
+                'event_type': row[0],
+                'event_data': row[1],
+                'user_id': row[2],
+                'username': row[3],
+                'timestamp': row[4]
+            }
+            for row in rows
+        ]
+
+
 # =============================================================================
 # FORMS LIST FUNCTIONS (curated list for /listforms)
 # =============================================================================
@@ -363,3 +480,77 @@ async def is_form_in_list(form_id: str) -> bool:
         ) as cursor:
             row = await cursor.fetchone()
             return row is not None
+
+
+# =============================================================================
+# REMINDER SUBSCRIPTION FUNCTIONS
+# =============================================================================
+
+async def subscribe_to_reminders(user_id: int, chat_id: int, username: str = None):
+    """Subscribe a user to deadline reminders."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO reminder_subscriptions (user_id, chat_id, username, subscribed_at, enabled)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(user_id) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                username = excluded.username,
+                enabled = 1
+        ''', (user_id, chat_id, username, datetime.now().isoformat()))
+        await db.commit()
+        print(f"[DEBUG] User {username} ({user_id}) subscribed to reminders")
+
+
+async def unsubscribe_from_reminders(user_id: int):
+    """Unsubscribe a user from deadline reminders."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'UPDATE reminder_subscriptions SET enabled = 0 WHERE user_id = ?',
+            (user_id,)
+        )
+        await db.commit()
+        print(f"[DEBUG] User {user_id} unsubscribed from reminders")
+
+
+async def is_subscribed_to_reminders(user_id: int) -> bool:
+    """Check if a user is subscribed to reminders."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT enabled FROM reminder_subscriptions WHERE user_id = ?',
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row is not None and row[0] == 1
+
+
+async def get_all_reminder_subscribers():
+    """Get all users who are subscribed to reminders."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT user_id, chat_id, username FROM reminder_subscriptions WHERE enabled = 1'
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {'user_id': row[0], 'chat_id': row[1], 'username': row[2]}
+                for row in rows
+            ]
+
+
+async def get_reminder_subscriber_count() -> int:
+    """Get the count of reminder subscribers."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT COUNT(*) FROM reminder_subscriptions WHERE enabled = 1'
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+
+async def log_sent_reminder(reminder_type: str, target_date: str, message: str, sent_count: int):
+    """Log a sent reminder for tracking."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO scheduled_reminders (reminder_type, target_date, message, sent_at, sent_to_count)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (reminder_type, target_date, message, datetime.now().isoformat(), sent_count))
+        await db.commit()
