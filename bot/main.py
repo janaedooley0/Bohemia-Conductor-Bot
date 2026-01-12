@@ -628,6 +628,7 @@ class JotFormHelper:
         print(f"[DEBUG] search_submission_in_form - Searching form {form_id} for: {search_value}")
 
         search_normalized = str(search_value).strip().lower()
+        search_parts = search_normalized.split()  # Split for partial matching (e.g., "Emily March" -> ["emily", "march"])
 
         try:
             # Get submissions for this form
@@ -640,9 +641,12 @@ class JotFormHelper:
                 print(f"[DEBUG] search_submission_in_form - No submissions found in form {form_id}")
                 return None
 
+            print(f"[DEBUG] search_submission_in_form - Found {len(submissions)} submissions to search")
+
             for submission in submissions:
                 answers = submission.get('answers', {})
                 match_found = False
+                all_text_values = []  # Collect all text for broad search
 
                 # Collect all data from this submission
                 submission_data = {
@@ -664,64 +668,116 @@ class JotFormHelper:
                 for field_id, field_data in answers.items():
                     field_name = field_data.get('name', '').lower()
                     field_text = field_data.get('text', '').lower()
+                    field_type = field_data.get('type', '').lower()
                     answer = field_data.get('answer', '')
-                    answer_str = str(answer).strip() if answer else ''
+                    pretty_format = field_data.get('prettyFormat', '')
+
+                    # Handle different answer formats
+                    answer_str = ''
+                    if isinstance(answer, dict):
+                        # JotForm name fields often return {first: "...", last: "..."}
+                        if 'first' in answer or 'last' in answer:
+                            first = answer.get('first', '')
+                            last = answer.get('last', '')
+                            answer_str = f"{first} {last}".strip()
+                        else:
+                            answer_str = pretty_format or str(answer)
+                    elif isinstance(answer, list):
+                        # Handle list answers (products, checkboxes, etc.)
+                        answer_str = ', '.join(str(x) for x in answer if x)
+                    else:
+                        answer_str = str(answer).strip() if answer else ''
+
+                    # Use prettyFormat if available and answer_str is empty
+                    if not answer_str and pretty_format:
+                        answer_str = str(pretty_format).strip()
+
                     answer_lower = answer_str.lower()
 
                     # Store raw answer for reference
                     submission_data['raw_answers'][field_name or field_text] = answer_str
 
+                    # Collect all text for broad search
+                    if answer_str:
+                        all_text_values.append(answer_lower)
+
                     # Check for invoice field
-                    if any(kw in field_name or kw in field_text for kw in ['invoice', 'order number', 'order id', 'reference', 'confirmation']):
+                    if any(kw in field_name or kw in field_text for kw in ['invoice', 'order number', 'order id', 'reference', 'confirmation', 'transaction']):
                         submission_data['invoice_id'] = answer_str
-                        if answer_lower == search_normalized or search_normalized in answer_lower:
+                        if search_normalized in answer_lower or answer_lower in search_normalized:
+                            print(f"[DEBUG] search_submission_in_form - Invoice match: {answer_str}")
                             match_found = True
 
-                    # Check for name fields
-                    if any(kw in field_name or kw in field_text for kw in ['name', 'full name', 'first name', 'last name']):
-                        if submission_data['customer_name']:
-                            submission_data['customer_name'] += ' ' + answer_str
+                    # Check for name fields (including JotForm's control_fullname type)
+                    if field_type == 'control_fullname' or any(kw in field_name or kw in field_text for kw in ['name', 'full name', 'your name']):
+                        # Handle JotForm's name field structure
+                        if isinstance(answer, dict):
+                            first = answer.get('first', '')
+                            last = answer.get('last', '')
+                            full_name = f"{first} {last}".strip()
+                            submission_data['customer_name'] = full_name
+                            # Check if search matches first, last, or full name
+                            name_lower = full_name.lower()
+                            if (search_normalized in name_lower or
+                                name_lower in search_normalized or
+                                all(part in name_lower for part in search_parts)):
+                                print(f"[DEBUG] search_submission_in_form - Name match: {full_name}")
+                                match_found = True
                         else:
-                            submission_data['customer_name'] = answer_str
-                        if answer_lower == search_normalized or search_normalized in answer_lower:
-                            match_found = True
+                            if submission_data['customer_name']:
+                                submission_data['customer_name'] += ' ' + answer_str
+                            else:
+                                submission_data['customer_name'] = answer_str
+                            if search_normalized in answer_lower or all(part in answer_lower for part in search_parts):
+                                print(f"[DEBUG] search_submission_in_form - Name match: {answer_str}")
+                                match_found = True
 
                     # Check for Telegram username
-                    if any(kw in field_name or kw in field_text for kw in ['telegram', 'tg', 'username', 'tg username', 'telegram username']):
+                    if any(kw in field_name or kw in field_text for kw in ['telegram', 'tg', 'tg username', 'telegram username', 'tg handle', 'telegram handle']):
                         # Clean up @ symbol if present
                         tg_username = answer_str.lstrip('@')
                         submission_data['telegram_username'] = tg_username
-                        if tg_username.lower() == search_normalized.lstrip('@') or search_normalized.lstrip('@') in tg_username.lower():
+                        search_tg = search_normalized.lstrip('@')
+                        if search_tg in tg_username.lower() or tg_username.lower() in search_tg:
+                            print(f"[DEBUG] search_submission_in_form - TG username match: {tg_username}")
                             match_found = True
 
                     # Check for email
-                    if 'email' in field_name or 'email' in field_text:
+                    if 'email' in field_name or 'email' in field_text or field_type == 'control_email':
                         submission_data['email'] = answer_str
-                        if answer_lower == search_normalized:
+                        if search_normalized == answer_lower or search_normalized in answer_lower:
+                            print(f"[DEBUG] search_submission_in_form - Email match: {answer_str}")
                             match_found = True
 
-                    # Check for products (usually in product list or order items)
-                    if any(kw in field_name or kw in field_text for kw in ['product', 'item', 'order', 'purchase']):
+                    # Check for products (payment field or product list)
+                    if field_type == 'control_payment' or any(kw in field_name or kw in field_text for kw in ['product', 'item', 'purchase']):
                         if isinstance(answer, list):
                             for item in answer:
                                 if isinstance(item, dict):
                                     product_name = item.get('name', item.get('text', str(item)))
                                     quantity = item.get('quantity', item.get('qty', '1'))
                                     price = item.get('price', item.get('amount', ''))
-                                    submission_data['products'].append({
-                                        'name': product_name,
-                                        'quantity': quantity,
-                                        'price': price
-                                    })
-                                else:
+                                    if product_name:
+                                        submission_data['products'].append({
+                                            'name': product_name,
+                                            'quantity': quantity,
+                                            'price': price
+                                        })
+                                elif item:
                                     submission_data['products'].append({'name': str(item), 'quantity': '1', 'price': ''})
-                        elif answer_str:
-                            # Could be a text description of products
+                        elif answer_str and answer_str != 'N/A':
                             submission_data['products'].append({'name': answer_str, 'quantity': '', 'price': ''})
+
+                # If no specific field match, do a broad search across all values
+                if not match_found:
+                    combined_text = ' '.join(all_text_values)
+                    if search_normalized in combined_text or all(part in combined_text for part in search_parts):
+                        print(f"[DEBUG] search_submission_in_form - Broad match found in submission {submission.get('id')}")
+                        match_found = True
 
                 if match_found:
                     submission_data['found'] = True
-                    print(f"[DEBUG] search_submission_in_form - Match found! Invoice: {submission_data['invoice_id']}")
+                    print(f"[DEBUG] search_submission_in_form - Match found! Invoice: {submission_data['invoice_id']}, Name: {submission_data['customer_name']}")
                     return submission_data
 
             print(f"[DEBUG] search_submission_in_form - No match found for: {search_value}")
@@ -2855,7 +2911,8 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", status_cancel)],
-        allow_reentry=True
+        allow_reentry=True,
+        per_message=False
     )
     app.add_handler(check_status_handler)
 
@@ -2875,7 +2932,8 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", report_cancel)],
-        allow_reentry=True
+        allow_reentry=True,
+        per_message=False
     )
     app.add_handler(report_problem_handler)
 
