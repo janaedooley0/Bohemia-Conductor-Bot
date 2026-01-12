@@ -2420,45 +2420,109 @@ async def submit_problem_report(update: Update, context: ContextTypes.DEFAULT_TY
     description = context.user_data.get('report_description', 'No description')
     photo_file_id = context.user_data.get('report_photo')
 
+    # Try to look up order details from JotForm
+    order_details = ""
+    try:
+        # Search for the order across all forms
+        result = jotform_helper.search_submission_by_invoice(invoice_id)
+        if result and result.get('found'):
+            order_details = (
+                f"\n📦 ORDER DETAILS FOUND:\n"
+                f"Form: {result.get('form_title', 'Unknown')}\n"
+                f"Customer: {result.get('customer_name', 'N/A')}\n"
+                f"TG Username: @{result.get('telegram_username', 'N/A')}\n"
+            )
+            products = result.get('products', [])
+            if products:
+                order_details += "Products:\n"
+                for p in products[:5]:  # Limit to 5 products
+                    import re
+                    name = re.sub(r'<[^>]+>', '', str(p.get('name', 'Unknown')))
+                    qty = p.get('quantity', '')
+                    order_details += f"  - {name}"
+                    if qty:
+                        order_details += f" (x{qty})"
+                    order_details += "\n"
+    except Exception as e:
+        print(f"[DEBUG] submit_problem_report - Could not look up order: {e}")
+        order_details = "\n⚠️ Could not look up order details automatically.\n"
+
     # Format the report message
     report_message = (
-        "🚨 NEW PROBLEM REPORT 🚨\n\n"
-        f"From: @{user.username or 'No username'} ({user.first_name})\n"
-        f"User ID: {user.id}\n"
-        f"Invoice ID: {invoice_id}\n\n"
-        f"Problem Description:\n{description}\n\n"
-        f"{'📷 Photo attached below' if photo_file_id else 'No photo attached'}"
+        "🚨 NEW PROBLEM REPORT 🚨\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 FROM: @{user.username or 'No username'} ({user.first_name})\n"
+        f"🆔 User ID: {user.id}\n"
+        f"🧾 Invoice: {invoice_id}\n"
+        f"{order_details}\n"
+        f"❗ PROBLEM DESCRIPTION:\n{description}\n\n"
+        f"{'📷 Photo attached below' if photo_file_id else '📷 No photo attached'}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-    # Try to forward to admin
+    # Send to all admins (ADMIN_CHAT_ID + registered admins)
     admin_notified = False
+    sent_count = 0
 
+    # Try ADMIN_CHAT_ID first
     if ADMIN_CHAT_ID:
         try:
-            # Send to admin's direct chat
             await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
+                chat_id=int(ADMIN_CHAT_ID),
                 text=report_message
             )
             if photo_file_id:
                 await context.bot.send_photo(
-                    chat_id=ADMIN_CHAT_ID,
+                    chat_id=int(ADMIN_CHAT_ID),
                     photo=photo_file_id,
-                    caption=f"Photo for problem report - Invoice: {invoice_id}"
+                    caption=f"📷 Photo for problem report\nInvoice: {invoice_id}\nFrom: @{user.username or user.first_name}"
                 )
+            sent_count += 1
             admin_notified = True
+            print(f"[DEBUG] submit_problem_report - Sent to ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
         except Exception as e:
-            print(f"[ERROR] submit_problem_report - Failed to send to admin chat: {e}")
+            print(f"[ERROR] submit_problem_report - Failed to send to ADMIN_CHAT_ID: {e}")
+
+    # Also send to all registered admins
+    try:
+        admins = await get_all_admins()
+        for admin in admins:
+            admin_id = admin.get('user_id')
+            # Skip if same as ADMIN_CHAT_ID (already sent)
+            if ADMIN_CHAT_ID and str(admin_id) == str(ADMIN_CHAT_ID):
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=report_message
+                )
+                if photo_file_id:
+                    await context.bot.send_photo(
+                        chat_id=admin_id,
+                        photo=photo_file_id,
+                        caption=f"📷 Photo for problem report\nInvoice: {invoice_id}\nFrom: @{user.username or user.first_name}"
+                    )
+                sent_count += 1
+                admin_notified = True
+                print(f"[DEBUG] submit_problem_report - Sent to admin: {admin_id}")
+            except Exception as e:
+                print(f"[DEBUG] submit_problem_report - Failed to send to admin {admin_id}: {e}")
+    except Exception as e:
+        print(f"[ERROR] submit_problem_report - Failed to get admins: {e}")
+
+    # Log if no admins were notified
+    if not admin_notified:
+        print(f"[WARNING] submit_problem_report - No admins were notified! Check ADMIN_CHAT_ID or add admins with /addadmin")
 
     # Store the report in the database for record keeping
     try:
-        from database import log_event
         await log_event(
             event_type='problem_report',
             event_data=json.dumps({
                 'invoice_id': invoice_id,
                 'description': description,
-                'has_photo': bool(photo_file_id)
+                'has_photo': bool(photo_file_id),
+                'admins_notified': sent_count
             }),
             user_id=user.id,
             username=user.username
@@ -2467,24 +2531,19 @@ async def submit_problem_report(update: Update, context: ContextTypes.DEFAULT_TY
         print(f"[ERROR] submit_problem_report - Failed to log event: {e}")
 
     # Send confirmation to user
+    confirmation_msg = (
+        "✅ Your problem report has been submitted!\n\n"
+        f"🧾 Invoice: {invoice_id}\n"
+        f"❗ Issue: {description[:100]}{'...' if len(description) > 100 else ''}\n\n"
+        f"An admin (@{ADMIN_USERNAME}) will review your report and get back to you.\n"
+        "Please be patient - they typically respond within 24-48 hours.\n\n"
+        "Thank you for letting us know about this issue!"
+    )
+
     if from_callback:
-        await update.callback_query.edit_message_text(
-            "Your problem report has been submitted!\n\n"
-            f"Invoice: {invoice_id}\n"
-            f"Issue: {description[:100]}{'...' if len(description) > 100 else ''}\n\n"
-            f"An admin (@{ADMIN_USERNAME}) will review your report and get back to you.\n"
-            "Please be patient - they typically respond within 24-48 hours.\n\n"
-            "Thank you for letting us know about this issue!"
-        )
+        await update.callback_query.edit_message_text(confirmation_msg)
     else:
-        await update.message.reply_text(
-            "Your problem report has been submitted!\n\n"
-            f"Invoice: {invoice_id}\n"
-            f"Issue: {description[:100]}{'...' if len(description) > 100 else ''}\n\n"
-            f"An admin (@{ADMIN_USERNAME}) will review your report and get back to you.\n"
-            "Please be patient - they typically respond within 24-48 hours.\n\n"
-            "Thank you for letting us know about this issue!"
-        )
+        await update.message.reply_text(confirmation_msg)
 
     # Clear user data
     context.user_data.clear()
