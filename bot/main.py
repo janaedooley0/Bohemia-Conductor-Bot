@@ -928,7 +928,7 @@ async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if user provided a search filter
         search_filter = " ".join(context.args).lower() if context.args else None
 
-        form_id, is_manual = await get_current_gb_form_id()
+        form_id, _ = await get_current_gb_form_id()
 
         if not form_id:
             await update.message.reply_text(
@@ -936,15 +936,11 @@ async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Get form title
-        forms = jotform_helper.get_all_forms()
-        form_title = forms.get(form_id, {}).get('title', 'Current GB')
-
         # Get products
         products = jotform_helper.get_products(form_id)
 
         if not products:
-            await update.message.reply_text(f"No products found in {form_title}.")
+            await update.message.reply_text("No products found for the current GB.")
             return
 
         # Filter products if search term provided
@@ -955,14 +951,14 @@ async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             if not filtered_products:
                 await update.message.reply_text(
-                    f"No products matching '{search_filter}' found in {form_title}.\n"
+                    f"No products matching '{search_filter}' found.\n"
                     f"Use /products without arguments to see all {len(products)} products."
                 )
                 return
             products = filtered_products
 
         # Format product list
-        lines = [f"Products in {form_title}:\n"]
+        lines = ["Current G&B Product List:\n"]
 
         for idx, product in enumerate(products, 1):
             name = product.get('name', 'N/A')
@@ -970,13 +966,16 @@ async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{idx}. {name} - ${price}")
 
             # Stop if message gets too long (Telegram limit ~4096 chars)
-            if len("\n".join(lines)) > 3500:
+            if len("\n".join(lines)) > 3200:
                 lines.append(f"\n... and {len(products) - idx} more products.")
                 lines.append("Use /products <search> to filter (e.g., /products reta)")
                 break
 
         if search_filter:
             lines.append(f"\nShowing {len(products)} products matching '{search_filter}'")
+
+        # Add helpful footer
+        lines.append("\nUse /jotform to place an order, or ask me about specific products for details on MOQ, testing, and more!")
 
         await update.message.reply_text("\n".join(lines))
 
@@ -988,7 +987,7 @@ async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the deadline for the current Group Buy."""
     try:
-        form_id, is_manual = await get_current_gb_form_id()
+        form_id, _ = await get_current_gb_form_id()
 
         if not form_id:
             await update.message.reply_text(
@@ -996,35 +995,17 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Get form info
-        forms = jotform_helper.get_all_forms()
-        form_title = forms.get(form_id, {}).get('title', 'Current GB')
-
-        # Check database first for manually set deadline
+        # Check database for manually set deadline
         db_deadline = await get_deadline()
-        deadline_info = await get_deadline_info() if db_deadline else None
 
         if db_deadline:
-            response = f"Deadline for {form_title}:\n\n{db_deadline}\n\nSubmit your order before this date!"
-            if deadline_info and deadline_info.get('updated_by'):
-                response += f"\n\n(Set by @{deadline_info['updated_by']})"
-            await update.message.reply_text(response)
+            # Just show the raw deadline text, no metadata
+            await update.message.reply_text(db_deadline)
         else:
-            # Fall back to JotForm metadata
-            metadata = jotform_helper.get_form_metadata(form_id)
-            deadline = metadata.get('deadline') or metadata.get('closing_date')
-
-            if deadline:
-                await update.message.reply_text(
-                    f"Deadline for {form_title}:\n\n"
-                    f"{deadline}\n\n"
-                    "Submit your order before this date!"
-                )
-            else:
-                await update.message.reply_text(
-                    f"No deadline set for {form_title}.\n\n"
-                    "An admin can set it with /setdeadline <date>"
-                )
+            await update.message.reply_text(
+                "No deadline set.\n\n"
+                "An admin can set it with /setdeadline"
+            )
 
     except Exception as e:
         print(f"[ERROR] deadline_command: {e}")
