@@ -958,9 +958,32 @@ def detect_month_in_message(message_text):
     return None
 
 
+def is_form_specific_query(message_text):
+    """
+    Check if the user is explicitly asking about a specific form/GB.
+    Returns True if the message mentions forms, GBs, months, or form-specific keywords.
+    """
+    message_lower = message_text.lower()
+
+    # Form-specific keywords
+    form_keywords = [
+        'form', 'gb', 'g&b', 'group buy', 'groupbuy', 'order form',
+        'current', 'latest', 'newest', 'recent', 'this month',
+        'halloween', 'fireworks', 'holiday', 'expo', 'november', 'october',
+        'january', 'february', 'march', 'april', 'may', 'june',
+        'july', 'august', 'september', 'december'
+    ]
+
+    return any(keyword in message_lower for keyword in form_keywords)
+
+
 def analyze_message_for_gb(message_text, available_forms):
     """
     Analyze user message to determine which form(s) they're asking about.
+
+    IMPORTANT: If the user appears to be asking about a PRODUCT (not a specific form),
+    we search for the product across all forms FIRST. ChatGPT form selection is only
+    used when the user explicitly mentions a form/GB/month.
 
     Returns:
         - A single form_id string if one form is clearly identified
@@ -969,7 +992,19 @@ def analyze_message_for_gb(message_text, available_forms):
     """
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-    # Check if user mentions a specific month
+    # PRIORITY 1: If this looks like a product query (not form-specific),
+    # search for the product across all forms FIRST
+    if not is_form_specific_query(message_text):
+        print(f"[DEBUG] analyze_message_for_gb - Message appears to be a product query, trying product search first")
+        product_matches = find_form_by_product_names(message_text, available_forms, return_all_matches=True)
+
+        if product_matches:
+            print(f"[DEBUG] analyze_message_for_gb - Product search found matches: {product_matches}")
+            return product_matches
+        else:
+            print(f"[DEBUG] analyze_message_for_gb - No product matches, will try ChatGPT form identification")
+
+    # PRIORITY 2: Check if user mentions a specific month
     mentioned_month = detect_month_in_message(message_text)
     if mentioned_month:
         # Find all forms matching this month
@@ -980,8 +1015,10 @@ def analyze_message_for_gb(message_text, available_forms):
             # Multiple forms for this month - we'll need to check all of them
             print(f"[DEBUG] analyze_message_for_gb - Multiple forms for {mentioned_month}: {matching_month_forms}")
             return matching_month_forms
+        elif len(matching_month_forms) == 1:
+            return matching_month_forms[0]
 
-    # Sort forms by latest submission date to identify the most recent/current GB
+    # PRIORITY 3: Use ChatGPT to identify the form (only for form-specific queries)
     sorted_forms = sorted(
         available_forms.items(),
         key=lambda x: x[1].get('latest_submission', x[1].get('created', '')),
@@ -1005,7 +1042,8 @@ Analyze the user's message and determine which form they're asking about:
 2. CRITICAL: If they ask about "current", "latest", "newest", or "most recent" GB, choose the FIRST form in the list (it has the most recent submission activity)
 3. If they mention a date, match it to the closest form by Latest Activity timestamp
 4. If they mention a vendor name, try to match it to a form title
-5. If the message is completely unclear or ambiguous, respond with "UNCLEAR"
+5. CRITICAL: If the user is asking about a PRODUCT (like "R30", "Retatrutide", "Tirz", etc.) and NOT mentioning a specific form, respond with "UNCLEAR" - the product should be searched across forms
+6. If the message is completely unclear or ambiguous, respond with "UNCLEAR"
 
 NOTE: Forms are sorted by latest submission date, NOT creation date. The first form is the most currently active GB.
 
